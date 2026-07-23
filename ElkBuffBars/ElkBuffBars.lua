@@ -255,6 +255,7 @@ function ElkBuffBars:OnInitialize()
             hidebuffframe = true,
             hidetenchframe = true,
             hidetrackingframe = false,
+            hidevanitybuffs = false,
             nameoverride = {
                 BUFF = {},
                 DEBUFF = {},
@@ -441,6 +442,7 @@ function ElkBuffBars:PLAYER_ENTERING_WORLD()
     self:HandleFrame_Blizzard_BuffFrame(self.db.profile.hidebuffframe)
     self:HandleFrame_Blizzard_TemporaryEnchantFrame(self.db.profile.hidetenchframe)
     self:HandleFrame_Blizzard_MiniMapTracking(self.db.profile.hidetrackingframe)
+    self:HandleFrame_Blizzard_VanityBuffs(self.db.profile.hidevanitybuffs)
     self:DoFullUpdate()
 end
 
@@ -496,6 +498,21 @@ function ElkBuffBars:HandleFrame_Blizzard_TemporaryEnchantFrame(hide)
     elseif hidden_blizzard_frames["TemporaryEnchantFrame"] then
         TemporaryEnchantFrame:Show()
         hidden_blizzard_frames["TemporaryEnchantFrame"] = nil
+    end
+end
+
+-- "VanityBuffs" is Ascension's own frame for its long-duration/vanity buffs (Bonus XP,
+-- Keeper's Scrolls, Well Rested, etc.) -- it's separate from Blizzard's BuffFrame, so hiding
+-- BuffFrame alone doesn't touch it. Not a Blizzard/retail global, so it's guarded with a
+-- nil-check rather than the WOW_PROJECT_ID checks used for the other Handle* functions.
+function ElkBuffBars:HandleFrame_Blizzard_VanityBuffs(hide)
+    if not VanityBuffs then return end
+    if hide then
+        VanityBuffs:Hide()
+        hidden_blizzard_frames["VanityBuffs"] = true
+    elseif hidden_blizzard_frames["VanityBuffs"] then
+        VanityBuffs:Show()
+        hidden_blizzard_frames["VanityBuffs"] = nil
     end
 end
 
@@ -1095,13 +1112,19 @@ function ElkBuffBars:ScanData_TENCH_Helper(...)
     --		if rank then
     --			rank = string_match(rank, PATTERN_RANK)
     --		end
-            if maxtimes[enchantId] and timemax < maxtimes[enchantId] then
-                timemax = maxtimes[enchantId]
-            else
-                maxtimes[enchantId] = timemax
+            -- Some Ascension-custom weapon enchants (e.g. "Ice Engraving") don't come back
+            -- with a real enchantId from GetWeaponEnchantInfo(), which crashed here with
+            -- "table index is nil" the moment one was equipped. Just skip the smoothing
+            -- cache for those instead of erroring -- the bar still works fine without it.
+            if enchantId then
+                if maxtimes[enchantId] and timemax < maxtimes[enchantId] then
+                    timemax = maxtimes[enchantId]
+                else
+                    maxtimes[enchantId] = timemax
+                end
             end
             local charges = enchantCharges or 0
-            if charges > 1 and (not maxcharges[enchantId] or maxcharges[enchantId] < charges) then
+            if enchantId and charges > 1 and (not maxcharges[enchantId] or maxcharges[enchantId] < charges) then
                 maxcharges[enchantId] = charges
             end
 
@@ -1114,7 +1137,7 @@ function ElkBuffBars:ScanData_TENCH_Helper(...)
             dt.type				= self.db.profile.typeoverride.TENCH[name] or "TENCH"
             dt.realtype			= "TENCH"
             dt.debufftype		= nil
-            dt.expirytime		= enchantExpiration + value_GetTime
+            dt.expirytime		= timemax + value_GetTime
             dt.timemax			= timemax
             dt.timeMod			= 0
             dt.untilcancelled	= nil
@@ -1301,7 +1324,15 @@ local function getTooltipScanner()
             return nil
         end
     else
-        tooltipScanner = CreateFrame("GameTooltip", "ElkBuffBarsTooltipScanner", nil, "SharedTooltipTemplate")
+        -- "SharedTooltipTemplate" doesn't exist in Ascension's (pre-refactor) FrameXML, which
+        -- made CreateFrame() throw here and silently kill weapon-buff/tracking name scanning
+        -- for the rest of the session. Fall back to the classic "GameTooltipTemplate", which
+        -- has been present since Vanilla/Wrath and provides the same FontString-based lines.
+        local ok
+        ok, tooltipScanner = pcall(CreateFrame, "GameTooltip", "ElkBuffBarsTooltipScanner", nil, "SharedTooltipTemplate")
+        if not ok or not tooltipScanner then
+            tooltipScanner = CreateFrame("GameTooltip", "ElkBuffBarsTooltipScanner", nil, "GameTooltipTemplate")
+        end
         tooltipScanner:SetOwner(UIParent, "ANCHOR_NONE")
 
         function tooltipScanner:GetEnchantNameForPlayerSlot(slot)
@@ -1353,7 +1384,10 @@ function ElkBuffBars:GetTempBuffName(slot, enchantId)
                 rank = roman_to_arabic[rank]
             end
         end
-        enchantNameCache[enchantId] = enchantName
+        if enchantId then
+            -- some Ascension-custom enchants have no real enchantId; just skip caching those
+            enchantNameCache[enchantId] = enchantName
+        end
         return enchantName, rank
     end
 
@@ -1506,6 +1540,18 @@ function ElkBuffBars:GetOptions()
                         set = function(info, v)
                             ElkBuffBars.db.profile.hidebuffframe = v
                             ElkBuffBars:HandleFrame_Blizzard_BuffFrame(ElkBuffBars.db.profile.hidebuffframe)
+                        end,
+                    },
+                    vanitybuffs = {
+                        order = 105.5,
+                        type = "toggle",
+                        width = "full",
+                        name = L["OPTIONS_HIDEVANITYBUFFS_NAME"],
+                        desc = L["OPTIONS_HIDEVANITYBUFFS_DESC"],
+                        get = function(info) return ElkBuffBars.db.profile.hidevanitybuffs end,
+                        set = function(info, v)
+                            ElkBuffBars.db.profile.hidevanitybuffs = v
+                            ElkBuffBars:HandleFrame_Blizzard_VanityBuffs(ElkBuffBars.db.profile.hidevanitybuffs)
                         end,
                     },
                     tenchframe = {
