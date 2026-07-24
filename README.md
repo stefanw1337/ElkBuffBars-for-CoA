@@ -1,4 +1,4 @@
-This is NOT my original work, I've used Claude AI to fix this addon. Go to the original addons page and support the developer of this.
+This is NOT my original work, I've used Claude AI to fix and maintain features of this addon. Go to the original addons page and support the developer of this.
 https://www.curseforge.com/wow/addons/elkbuffbars
 
 I fixed the addon to make it work with Ascension WoW: CoA.
