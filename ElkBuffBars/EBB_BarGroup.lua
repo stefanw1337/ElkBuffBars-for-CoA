@@ -93,7 +93,17 @@ function prototype:SetPosition()
 	local layout = self.layout
 	self.frames.container:ClearAllPoints()
 	if layout.stickto then
-		self.frames.container:SetPoint((layout.growup and "BOTTOM" or "TOP")..(layout.stickside or ""), ElkBuffBars.bargroups[layout.stickto]:GetContainer(), (layout.growup and "TOP" or "BOTTOM")..(layout.stickside or ""), 0, layout.growup and ElkBuffBars.db.profile.groupspacing or -ElkBuffBars.db.profile.groupspacing)
+		local target = ElkBuffBars.bargroups[layout.stickto]:GetContainer()
+		if layout.stickmode == "horizontal" then
+			-- attach beside the target group (my LEFT edge to their RIGHT edge, or vice versa),
+			-- aligned top/middle/bottom via stickvalign, so growth of either group pushes the other sideways.
+			local myside = layout.stickside == "RIGHT" and "RIGHT" or "LEFT"
+			local otherside = myside == "LEFT" and "RIGHT" or "LEFT"
+			local valign = layout.stickvalign or ""
+			self.frames.container:SetPoint(valign..myside, target, valign..otherside, 0, 0)
+		else
+			self.frames.container:SetPoint((layout.growup and "BOTTOM" or "TOP")..(layout.stickside or ""), target, (layout.growup and "TOP" or "BOTTOM")..(layout.stickside or ""), 0, layout.growup and ElkBuffBars.db.profile.groupspacing or -ElkBuffBars.db.profile.groupspacing)
+		end
 	elseif layout.x and layout.y then
 		self.frames.container:SetPoint(layout.growup and "BOTTOMLEFT" or "TOPLEFT", UIParent, "BOTTOMLEFT", layout.x, layout.y)
 	else
@@ -172,14 +182,42 @@ function prototype:UpdateAnchor()
 		end
 		self.frames.anchor:SetWidth(self.layout.bars.width)
 		self.frames.anchor:SetBackdropColor(self.layout.bars.barcolor[1], self.layout.bars.barcolor[2], self.layout.bars.barcolor[3], .5)
-		self.frames.anchortext:SetText(self.layout.anchortext)
-		self.frames.anchor:Show()
+		self:RefreshAnchorVisibility()
 	else
 		if self.frames.anchor then
 			self.frames.anchor:Hide()
 		end
 	end
 	self:UpdateData()
+end
+
+-- counts real (non-demo) entries currently in self.data
+function prototype:GetRealDataCount()
+	local count = 0
+	for _, v in ipairs(self.data) do
+		if v ~= DATA_DEMO then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+-- shows/hides the anchor (honoring Hide Anchor When Empty) and refreshes its "(count)" text.
+-- Deliberately does NOT call UpdateData/UpdateBars, so this is safe to call from UpdateBars()
+-- itself every time the buff count changes, without recursing.
+function prototype:RefreshAnchorVisibility()
+	local frames = self.frames
+	if not frames.anchor then return end
+	local count = self:GetRealDataCount()
+	local show = (self.layout.anchorshown or self.layout.configmode) and not (self.layout.hideanchorwhenempty and count == 0)
+	if show then
+		frames.anchor:Show()
+		if frames.anchortext then
+			frames.anchortext:SetText(self.layout.anchortext.." ("..count..")")
+		end
+	else
+		frames.anchor:Hide()
+	end
 end
 
 function prototype:StartMoving()
@@ -288,6 +326,22 @@ local sorting = {
 		end,
 }
 
+local GRACE_PERIOD = 0.3 -- seconds to keep showing a buff after it drops out of a scan, so a
+                          -- very short or rapidly-refreshing buff doesn't visibly flicker its
+                          -- bar away and back (the group shrinking then growing again)
+
+local function DataKey(data)
+	return (data.type or "").."|"..(data.realname or data.name or "").."|"..tostring(data.id or data.spellid or "")
+end
+
+local function CopyDataTable(v)
+	local copy = {}
+	for k, val in pairs(v) do
+		copy[k] = val
+	end
+	return copy
+end
+
 -- creates data for which bars will be created
 function prototype:UpdateData(updated)
 	if updated and not updated[self.layout.target] then return end
@@ -297,25 +351,45 @@ function prototype:UpdateData(updated)
 		data[k] = nil
 	end
 
-	for _, v in pairs(ElkBuffBars.buffdata[layout.target]) do
+	local now = GetTime()
+	if not self.gracecache then
+		self.gracecache = {}
+	end
+	local gracecache = self.gracecache
+	local seen = {}
+
+	local function collect(v)
 		if self:CheckFilter(v) then
 			table_insert(data, v)
+			local key = DataKey(v)
+			seen[key] = true
+			gracecache[key] = { data = CopyDataTable(v), lastseen = now }
 		end
 	end
+
+	for _, v in pairs(ElkBuffBars.buffdata[layout.target]) do
+		collect(v)
+	end
 	for _, v in pairs(ElkBuffBars.debuffdata[layout.target]) do
-		if self:CheckFilter(v) then
-			table_insert(data, v)
-		end
+		collect(v)
 	end
 	if layout.target == "player" then
 		for _, v in pairs(ElkBuffBars.tenchdata) do
-			if self:CheckFilter(v) then
-				table_insert(data, v)
-			end
+			collect(v)
 		end
 		for _, v in pairs(ElkBuffBars.trackingdata) do
-			if self:CheckFilter(v) then
-				table_insert(data, v)
+			collect(v)
+		end
+	end
+
+	-- anything that just vanished from the scan gets a brief grace period showing its last
+	-- known state, instead of its bar instantly disappearing (and likely reappearing next scan)
+	for key, held in pairs(gracecache) do
+		if not seen[key] then
+			if now - held.lastseen > GRACE_PERIOD then
+				gracecache[key] = nil
+			else
+				table_insert(data, held.data)
 			end
 		end
 	end
@@ -350,6 +424,7 @@ function prototype:UpdateBars()
 	for _, bar in pairs(bars) do
 		bar:GetContainer():Show()
 	end
+	self:RefreshAnchorVisibility()
 end
 
 -- orders the bars to update the texts shown

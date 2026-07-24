@@ -418,6 +418,29 @@ function ElkBuffBars:OnProfileEnable()
     end
     -- check bargroups
     self:CheckLayouts()
+
+    -- one-time migration: Time Fraction (tenths-of-a-second countdown text) used to default
+    -- to on, which looks flickery on short buffs. Flip this profile's existing groups to match
+    -- the new off-by-default just once, so re-enabling it per group afterward sticks.
+    if not self.db.profile.migrated_timefraction_default then
+        for _, bg in ipairs(self.db.profile.bargroups) do
+            if bg.bars then
+                bg.bars.timeFraction = false
+            end
+        end
+        self.db.profile.migrated_timefraction_default = true
+    end
+
+    -- one-time migration: turn off Config Mode / Show Anchor for all existing groups, so
+    -- the drag-anchor borders/gear icons aren't left showing once initial setup is done
+    if not self.db.profile.migrated_configmode_default then
+        for _, bg in ipairs(self.db.profile.bargroups) do
+            bg.configmode = false
+            bg.anchorshown = false
+        end
+        self.db.profile.migrated_configmode_default = true
+    end
+
     -- update known names
     self:UpdateKnownNames()
     -- create bargroups based on stored settings
@@ -427,6 +450,82 @@ end
 function ElkBuffBars:OnProfileDisable()
     -- recycle all bargroups
     self:RemoveBarGroups()
+end
+
+-- Export/Import: dump the current profile to a plain Lua table literal string (no
+-- compression/library dependency needed, it's just meant for backing up or moving settings
+-- between characters/computers) and read one back in.
+local function SerializeValue(v, buffer)
+    local t = type(v)
+    if t == "string" then
+        buffer[#buffer + 1] = string.format("%q", v)
+    elseif t == "number" or t == "boolean" then
+        buffer[#buffer + 1] = tostring(v)
+    elseif t == "table" then
+        buffer[#buffer + 1] = "{"
+        for k, val in pairs(v) do
+            buffer[#buffer + 1] = "["
+            SerializeValue(k, buffer)
+            buffer[#buffer + 1] = "]="
+            SerializeValue(val, buffer)
+            buffer[#buffer + 1] = ","
+        end
+        buffer[#buffer + 1] = "}"
+    else
+        -- functions/userdata/threads shouldn't appear in saved settings; fall back to nil
+        -- rather than erroring so one bad value doesn't break the whole export
+        buffer[#buffer + 1] = "nil"
+    end
+end
+
+local function SerializeTable(tbl)
+    local buffer = {}
+    SerializeValue(tbl, buffer)
+    return table.concat(buffer)
+end
+
+local function DeserializeString(str)
+    local chunk, err = loadstring("return " .. str)
+    if not chunk then
+        return nil, err or "couldn't parse that string"
+    end
+    -- strip access to globals so a pasted-in string can't reach outside its own data
+    setfenv(chunk, {})
+    local ok, result = pcall(chunk)
+    if not ok then
+        return nil, result
+    end
+    if type(result) ~= "table" then
+        return nil, "that doesn't look like a valid export string"
+    end
+    return result
+end
+
+function ElkBuffBars:ExportProfile()
+    return SerializeTable(self.db.profile)
+end
+
+function ElkBuffBars:ImportProfile(str)
+    if not str or string_trim(str) == "" then
+        return
+    end
+    local imported, err = DeserializeString(str)
+    if not imported then
+        self:Print("Import failed: " .. tostring(err))
+        return
+    end
+
+    -- wipe the current profile first, so keys that no longer exist in the imported
+    -- data (e.g. an older export) don't linger behind mixed in with the new settings
+    for k in pairs(self.db.profile) do
+        self.db.profile[k] = nil
+    end
+    for k, v in pairs(imported) do
+        self.db.profile[k] = v
+    end
+
+    self:OnProfileEnable()
+    self:Print("Settings imported.")
 end
 
 -- refresh layouts when new media is set
@@ -787,7 +886,7 @@ local DEFAULT_LAYOUT = {
         barbgcolor			= {0, 0.5, 1, 0.3},		-- <color set>
         debufftypecolor		= true,					-- true, false
         timeformat			= "CONDENSED",			-- "DEFAULT", "CLOCK", "CONDENSED"
-        timeFraction		= true,					-- true, false
+        timeFraction		= false,				-- true, false
         width				= 250,
         height				= 20,
         tooltipanchor		= "default",			-- <tooltip anchor>, "default"
@@ -805,9 +904,10 @@ local DEFAULT_LAYOUT = {
     target			= "player",						-- player, pet, target
     growup			= false,						-- true, false
     barspacing		= 0,							-- 0+
-    configmode		= true,							-- true, false
+    configmode		= false,						-- true, false
     anchortext		= "unknown bargroup",			-- <string>
     anchorshown		= false,						-- true, false
+    hideanchorwhenempty = false,					-- true, false
 }
 
 -- resets corrupt entries in the given layout to default values; returns a now valid layout
@@ -1059,8 +1159,16 @@ function ElkBuffBars:WEAPON_SLOT_CHANGED()
     self:ScanData_TENCH_Launcher()
 end
 
+local function hasRangedItemEquipped()
+    local rangedSlot = TENCH_INVENTORYSLOT[3]
+    return rangedSlot ~= nil and GetInventoryItemID("player", rangedSlot) ~= nil
+end
+
 function ElkBuffBars:ScanData_TENCH_Launcher()
-    if hasTEnch(GetWeaponEnchantInfo()) then
+    -- Ascension's ranged-weapon "gadget" buffs (e.g. Stim Rounds) never show up in
+    -- GetWeaponEnchantInfo(), so also keep the poller running whenever a ranged weapon is
+    -- equipped at all -- otherwise the timer would never even start for those buffs.
+    if hasTEnch(GetWeaponEnchantInfo()) or hasRangedItemEquipped() then
         if self.timer_TENCH == nil then
             self.timer_TENCH = self:ScheduleRepeatingTimer("ScanData_TENCH_Worker", .5)
             self:ScanData_TENCH_Worker()
@@ -1073,7 +1181,10 @@ function ElkBuffBars:ScanData_TENCH_Launcher()
 end
 
 function ElkBuffBars:ScanData_TENCH_Worker()
-    if hasTEnchUpdate(GetWeaponEnchantInfo()) then
+    -- hasTEnchUpdate() alone would never be true for a ranged gadget buff (GetWeaponEnchantInfo
+    -- never reflects it, so it never "changes"), so also force a rescan every tick while a
+    -- ranged weapon is equipped, to keep its tooltip-scanned duration fresh.
+    if hasTEnchUpdate(GetWeaponEnchantInfo()) or hasRangedItemEquipped() then
         self:ScanData_TENCH()
         self:UpdateGroups()
     end
@@ -1152,6 +1263,51 @@ function ElkBuffBars:ScanData_TENCH_Helper(...)
             table_insert(self.tenchdata, dt)
         end
     end
+
+    -- Ranged-weapon "gadget" buffs (e.g. engineering Stim Rounds) never come through
+    -- GetWeaponEnchantInfo() on this client, so fall back to scanning the ranged item's own
+    -- tooltip for a "Name (X min)" style line. Skip it if the normal loop above already added
+    -- something for that slot, to avoid double-listing it if Ascension ever fixes the API.
+    local rangedSlot = TENCH_INVENTORYSLOT[3]
+    if rangedSlot then
+        local alreadyHandled = false
+        for _, dt in ipairs(self.tenchdata) do
+            if dt.id == rangedSlot then
+                alreadyHandled = true
+                break
+            end
+        end
+        if not alreadyHandled then
+            local gadgetName, gadgetSeconds = self:GetGadgetBuffInfo(rangedSlot)
+            if gadgetName then
+                self:AddKnownName("TENCH", gadgetName)
+
+                local dt = GetDataTable()
+                dt.id				= rangedSlot
+                dt.spellid			= nil
+                dt.name				= self.db.profile.nameoverride.TENCH[gadgetName] or gadgetName
+                dt.realname			= gadgetName
+                dt.rank				= nil
+                dt.type				= self.db.profile.typeoverride.TENCH[gadgetName] or "TENCH"
+                dt.realtype			= "TENCH"
+                dt.debufftype		= nil
+                dt.expirytime		= gadgetSeconds + value_GetTime
+                dt.timemax			= gadgetSeconds
+                dt.timeMod			= 0
+                dt.untilcancelled	= nil
+                dt.charges			= 0
+                dt.maxcharges		= nil
+                dt.icon				= GetInventoryItemTexture("player", rangedSlot)
+                dt.ismine			= true
+                dt.casterName		= GetUnitName("player", true) or UNKNOWN
+                dt.casterClass		= (UnitClassBase("player")) or ""
+                dt.canStealOrPurge	= false
+
+                table_insert(self.tenchdata, dt)
+            end
+        end
+    end
+
     scan_happened.player = true
 end
 
@@ -1323,6 +1479,29 @@ local function getTooltipScanner()
 
             return nil
         end
+
+        function tooltipScanner:GetEnchantDurationForPlayerSlot(slot)
+            local tooltipData = C_TooltipInfo.GetInventoryItem("player", slot)
+            for _, line in ipairs(tooltipData.lines) do
+                if line.type == Enum.TooltipDataLineType.None then
+                    local text = line.leftText
+                    for num, unit in string_gmatch(text, "%((%d+) (%a+)%)") do
+                        if string_find(unit, "^min") or string_find(unit, "^sec") or string_find(unit, "^hour") or string_find(unit, "^hr") then
+                            local seconds = tonumber(num) or 0
+                            if string_find(unit, "^hour") or string_find(unit, "^hr") then
+                                seconds = seconds * 3600
+                            elseif string_find(unit, "^min") then
+                                seconds = seconds * 60
+                            end
+                            local name = select(3, string_find(text, "^(.+) %(%d+ [^%)]+%)$")) or text
+                            name = string_gsub(name, " %(%d+ [^%)]+%)", "")
+                            return name, seconds
+                        end
+                    end
+                end
+            end
+            return nil
+        end
     else
         -- "SharedTooltipTemplate" doesn't exist in Ascension's (pre-refactor) FrameXML, which
         -- made CreateFrame() throw here and silently kill weapon-buff/tracking name scanning
@@ -1359,6 +1538,38 @@ local function getTooltipScanner()
             self:ClearLines()
             self:SetTrackingSpell()
             return self.TextLeft1:GetText()
+        end
+
+        -- Ascension's GetWeaponEnchantInfo() never reports ranged-weapon "gadget" buffs
+        -- (e.g. engineering Stim Rounds) even while one is actively ticking down -- confirmed
+        -- by testing, it stays nil across the board. But the remaining time still shows up as
+        -- plain tooltip text on the item itself (e.g. "Stim Rounds (58 min)"), so scan for that
+        -- directly instead of relying on the (broken, for this case) enchant API.
+        function tooltipScanner:GetEnchantDurationForPlayerSlot(slot)
+            self:ClearLines()
+            self:SetInventoryItem("player", slot)
+            local regions = {self:GetRegions()}
+            for _, r in ipairs(regions) do
+                if r:IsObjectType("FontString") then
+                    local text = r:GetText()
+                    if text then
+                        for num, unit in string_gmatch(text, "%((%d+) (%a+)%)") do
+                            if string_find(unit, "^min") or string_find(unit, "^sec") or string_find(unit, "^hour") or string_find(unit, "^hr") then
+                                local seconds = tonumber(num) or 0
+                                if string_find(unit, "^hour") or string_find(unit, "^hr") then
+                                    seconds = seconds * 3600
+                                elseif string_find(unit, "^min") then
+                                    seconds = seconds * 60
+                                end
+                                local name = select(3, string_find(text, "^(.+) %(%d+ [^%)]+%)$")) or text
+                                name = string_gsub(name, " %(%d+ [^%)]+%)", "")
+                                return name, seconds
+                            end
+                        end
+                    end
+                end
+            end
+            return nil
         end
     end
 
@@ -1406,6 +1617,11 @@ function ElkBuffBars:GetTrackingName()
     return name or "Tracking..."
 end
 
+function ElkBuffBars:GetGadgetBuffInfo(slot)
+    local scanner = getTooltipScanner()
+    return scanner:GetEnchantDurationForPlayerSlot(slot)
+end
+
 function ElkBuffBars:DoFullUpdate()
     self:UNIT_AURA(watched_unitids)
     self:ScanData_TENCH()
@@ -1422,6 +1638,17 @@ function ElkBuffBars:UpdateGroups()
     end
 end
 
+local function StickGroup_CheckLoop(self, id, v)
+    local parent = v
+    while parent.layout.stickto do
+        if parent.layout.stickto == id then
+            return true
+        end
+        parent = self.bargroups[parent.layout.stickto]
+    end
+    return false
+end
+
 function ElkBuffBars:StickGroup(bargroup)
     local layout = bargroup.layout
     local id = layout.id
@@ -1430,55 +1657,83 @@ function ElkBuffBars:StickGroup(bargroup)
     local base_y = growup and container:GetBottom() or container:GetTop()
     local base_left = container:GetLeft()
     local base_right = container:GetRight()
+    local base_top = container:GetTop()
+    local base_bottom = container:GetBottom()
     layout.stickto = nil
+    layout.stickmode = nil
+    layout.stickvalign = nil
 --	self:Print("Sticking bargroup", id)
     for k, v in pairs(self.bargroups) do
-        local comp_container = v:GetContainer()
-        local comp_y = growup and comp_container:GetTop() or comp_container:GetBottom() or 0
-        if v.layout.id ~= id and math_abs(comp_y - base_y) < STICKTO_AREA then
-            -- we are on the same y-area
+        if v.layout.id ~= id then
+            local comp_container = v:GetContainer()
+            local comp_y = growup and comp_container:GetTop() or comp_container:GetBottom() or 0
+            if math_abs(comp_y - base_y) < STICKTO_AREA then
+                -- we are on the same y-area (stack above/below)
+                local comp_left = comp_container:GetLeft()
+                local comp_right = comp_container:GetRight()
+                local dist_left = math_abs(base_left - comp_left)
+                local dist_mid = math_abs((base_left + base_right) - (comp_left + comp_right)) / 2
+                local dist_right = math_abs(base_right - comp_right)
+                if dist_left <= STICKTO_AREA or dist_mid <= STICKTO_AREA or dist_right <= STICKTO_AREA then
+--					self:Print(" - sticking to bargroup ", k)
+                    -- we are also on the same x-area
+                    -- check if we would loop-stick to ourself
+                    if not StickGroup_CheckLoop(self, id, v) then
+                        -- we have found a valid group to stick to
+                        layout.stickto = k
+                        layout.stickmode = "vertical"
+                        local stickdist = STICKTO_AREA
+                        if dist_mid <= STICKTO_AREA then
+                            layout.stickside = ""
+                            stickdist = dist_mid
+                        end
+                        if dist_left <= STICKTO_AREA and dist_left < stickdist then
+                            layout.stickside = "LEFT"
+                            stickdist = dist_left
+                        end
+                        if dist_right <= STICKTO_AREA and dist_right < stickdist then
+                            layout.stickside = "RIGHT"
+                            stickdist = dist_right
+                        end
+                        bargroup:SetPosition()
+                        return true
+                    end
+                end
+            end
+
+            -- check for side-by-side (beside) proximity: my left edge near their right edge,
+            -- or my right edge near their left edge, aligned top/middle/bottom
+            local comp_top = comp_container:GetTop()
+            local comp_bottom = comp_container:GetBottom()
             local comp_left = comp_container:GetLeft()
             local comp_right = comp_container:GetRight()
-            local dist_left = math_abs(base_left - comp_left)
-            local dist_mid = math_abs((base_left + base_right) - (comp_left + comp_right)) / 2
-            local dist_right = math_abs(base_right - comp_right)
-            if dist_left <= STICKTO_AREA or dist_mid <= STICKTO_AREA or dist_right <= STICKTO_AREA then
---				self:Print(" - sticking to bargroup ", k)
-                -- we are also on the same x-area
-                -- check if we would loop-stick to ourself
-                local parent = v
-                local hasloop = false
-                while parent.layout.stickto do
-                    if parent.layout.stickto == id then
---						self:Print("   - LOOP FOUND!")
-                        hasloop = true
-                        break
+            local dist_myleft_theirright = math_abs(base_left - comp_right)
+            local dist_myright_theirleft = math_abs(base_right - comp_left)
+            if dist_myleft_theirright <= STICKTO_AREA or dist_myright_theirleft <= STICKTO_AREA then
+                local dist_top = math_abs(base_top - comp_top)
+                local dist_vmid = math_abs((base_top + base_bottom) - (comp_top + comp_bottom)) / 2
+                local dist_bottom = math_abs(base_bottom - comp_bottom)
+                if dist_top <= STICKTO_AREA or dist_vmid <= STICKTO_AREA or dist_bottom <= STICKTO_AREA then
+                    if not StickGroup_CheckLoop(self, id, v) then
+                        layout.stickto = k
+                        layout.stickmode = "horizontal"
+                        layout.stickside = (dist_myleft_theirright <= dist_myright_theirleft) and "LEFT" or "RIGHT"
+                        local vstickdist = STICKTO_AREA
+                        if dist_vmid <= STICKTO_AREA then
+                            layout.stickvalign = ""
+                            vstickdist = dist_vmid
+                        end
+                        if dist_top <= STICKTO_AREA and dist_top < vstickdist then
+                            layout.stickvalign = "TOP"
+                            vstickdist = dist_top
+                        end
+                        if dist_bottom <= STICKTO_AREA and dist_bottom < vstickdist then
+                            layout.stickvalign = "BOTTOM"
+                            vstickdist = dist_bottom
+                        end
+                        bargroup:SetPosition()
+                        return true
                     end
-                    parent = self.bargroups[parent.layout.stickto]
-                end
-                if not hasloop then
-                    -- we have found a valid group to stick to
-                    layout.stickto = k
-                    local stickdist = STICKTO_AREA
-                    if dist_mid <= STICKTO_AREA then
---~ 						self:Print("   - SUCCESS! -> middle")
-                        layout.stickside = ""
-                        stickdist = dist_mid
-                    end
-                    if dist_left <= STICKTO_AREA and dist_left < stickdist then
---~ 						self:Print("   - SUCCESS! -> left")
-                        layout.stickside = "LEFT"
-                        stickdist = dist_left
-                    end
-                    if dist_right <= STICKTO_AREA and dist_right < stickdist then
---~ 						self:Print("   - SUCCESS! -> right")
-                        layout.stickside = "RIGHT"
-                        stickdist = dist_right
---~ 					else
---~ 						self:Print("   - |cffff0000ERROR|r")
-                    end
-                    bargroup:SetPosition()
-                    return true
                 end
             end
         end
@@ -1629,7 +1884,110 @@ function ElkBuffBars:GetOptions()
                 type = "group",
                 name = L["OPTIONS_BARGROUPS_NAME"],
                 desc = L["OPTIONS_BARGROUPS_DESC"],
-                args = {},
+                args = {
+                    ["0"] = {
+                        order = 0,
+                        type = "group",
+                        name = L["OPTIONS_ALLGROUPS_NAME"],
+                        desc = L["OPTIONS_ALLGROUPS_DESC"],
+                        args = {
+                            configmode = {
+                                order = 101,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_CONFIG_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_CONFIG_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.configmode then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg:ToggleConfigMode(value)
+                                    end
+                                end,
+                            },
+                            anchorshown = {
+                                order = 102,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_ANCHOR_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_ANCHOR_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.anchorshown then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.anchorshown = value
+                                        bg:UpdateAnchor()
+                                    end
+                                end,
+                            },
+                            hideanchorwhenempty = {
+                                order = 102.5,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_HIDEANCHOREMPTY_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_HIDEANCHOREMPTY_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.hideanchorwhenempty then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.hideanchorwhenempty = value
+                                        bg:RefreshAnchorVisibility()
+                                    end
+                                end,
+                            },
+                        },
+                    },
+                },
+            },
+            exportimport = {
+                order = 103,
+                type = "group",
+                name = L["OPTIONS_EXPORTIMPORT_NAME"],
+                desc = L["OPTIONS_EXPORTIMPORT_DESC"],
+                args = {
+                    exportdesc = {
+                        order = 100,
+                        type = "description",
+                        name = L["OPTIONS_EXPORT_DESC"],
+                    },
+                    exportstring = {
+                        order = 101,
+                        type = "input",
+                        multiline = 14,
+                        width = "full",
+                        name = L["OPTIONS_EXPORT_NAME"],
+                        get = function() return ElkBuffBars:ExportProfile() end,
+                        set = function() end,
+                    },
+                    importdesc = {
+                        order = 200,
+                        type = "description",
+                        name = L["OPTIONS_IMPORT_DESC"],
+                    },
+                    importstring = {
+                        order = 201,
+                        type = "input",
+                        multiline = 14,
+                        width = "full",
+                        name = L["OPTIONS_IMPORT_NAME"],
+                        get = function() return "" end,
+                        set = function(info, value)
+                            ElkBuffBars:ImportProfile(value)
+                        end,
+                    },
+                },
             },
         }
     }
@@ -1779,6 +2137,19 @@ function ElkBuffBars:GetGroupOptions(id)
                     local bg = ElkBuffBars.bargroups[id]
                     bg.layout.anchorshown = not bg.layout.anchorshown
                     bg:UpdateAnchor()
+                end,
+            },
+            hideanchorwhenempty = {
+                order = 102.5,
+                type = "toggle",
+                width = "double",
+                name = L["OPTIONS_GROUP_HIDEANCHOREMPTY_NAME"],
+                desc = L["OPTIONS_GROUP_HIDEANCHOREMPTY_DESC"],
+                get = function(info) return ElkBuffBars.db.profile.bargroups[id].hideanchorwhenempty end,
+                set = function(info)
+                    local bg = ElkBuffBars.bargroups[id]
+                    bg.layout.hideanchorwhenempty = not bg.layout.hideanchorwhenempty
+                    bg:RefreshAnchorVisibility()
                 end,
             },
             anchortext = {
