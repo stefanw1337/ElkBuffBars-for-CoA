@@ -109,7 +109,13 @@ function prototype:OnEnter()
     else
         GameTooltip:SetOwner(self.frames.container, self.layout.tooltipanchor)
     end
-    if realtype == "BUFF" or realtype == "DEBUFF" then
+    if self.data.missing then
+        -- "Show Missing" placeholder -- self.data.id is just the buff's name here, not a real
+        -- aura index/inventory slot, so don't feed it to SetUnitAura/SetInventoryItem below
+        GameTooltip:AddLine(self.data.realname or self.data.name)
+        GameTooltip:AddLine(L["TOOLTIP_MISSING"], 1, 0.2, 0.2)
+        GameTooltip:Show()
+    elseif realtype == "BUFF" or realtype == "DEBUFF" then
         if realtype == "BUFF" then
             GameTooltip:SetUnitAura(self.parent.layout.target, self.data.id, "HELPFUL")
         else
@@ -150,6 +156,11 @@ function prototype:OnEnter()
             end
             GameTooltip:Show()
         end
+    end
+    if self.data.blacklisted then
+        -- Alert Unwanted: this is a real, active buff that's on your Black List
+        GameTooltip:AddLine(L["TOOLTIP_BLACKLISTED_ALERT"], 1, 0.55, 0)
+        GameTooltip:Show()
     end
 end
 
@@ -504,7 +515,15 @@ function prototype:UpdateData(data)
         end
     end
     if layout.bar then
-        if data.untilcancelled then
+        if data.missing then
+            -- "Show Missing" placeholder: always render as a full solid bar (colored red
+            -- below), regardless of the group's Timeless Full setting -- there's no real
+            -- timer to reflect, it's just a "you don't have this" indicator
+            frames.bar:SetWidth(self.barwidth_total)
+            frames.bar:SetTexCoord(0, 1, 0, 1)
+            frames.bar:Show()
+            if frames.spark then frames.spark:Hide() end
+        elseif data.untilcancelled then
             if layout.timelessfull then
                 frames.bar:SetWidth(self.barwidth_total)
                 frames.bar:SetTexCoord(0, 1, 0, 1)
@@ -540,7 +559,11 @@ function prototype:UpdateData(data)
             if layout.spark then frames.spark:Show() end
         end
         local barcolorR, barcolorG, barcolorB, barcolorA = unpack(layout["barcolor"])
-        if data.type == "DEBUFF" and layout.debufftypecolor then
+        if data.missing then
+            barcolorR, barcolorG, barcolorB, barcolorA = 0.8, 0.1, 0.1, 0.8
+        elseif data.blacklisted then
+            barcolorR, barcolorG, barcolorB, barcolorA = 1, 0.55, 0, 0.9 -- Alert Unwanted: orange warning color
+        elseif data.type == "DEBUFF" and layout.debufftypecolor then
             local debuffcolor = DebuffTypeColor[data.debufftype or "none"] or DebuffTypeColor["none"]
             barcolorR, barcolorG, barcolorB = debuffcolor.r, debuffcolor.g, debuffcolor.b
         end
@@ -559,7 +582,15 @@ function prototype:UpdateData(data)
     self:UpdateText()
 
     if not InCombatLockdown() then
+        -- Show Missing placeholder bars set data.id to the buff's NAME (a string, see
+        -- EBB_BarGroup.lua) instead of a real UnitAura index/inventory slot, since there's no
+        -- actual active buff to point at. Attaching the secure cancel-click button to one of
+        -- these fed that string into "*index2", which isn't a valid index -- SecureTemplates
+        -- fell through to its name-based cancel branch with no rank attribute set, and threw
+        -- "Usage: CancelUnitBuff(...)" (calling CancelUnitBuff("player", "")) on every click.
+        -- There's nothing real to cancel on a placeholder anyway, so just skip attaching it.
         if not layout.clickthrough and playerunit[self.parent.layout.target]
+          and not data.missing
           and (data.type == "BUFF" or data.type == "TENCH" or data.type == "TRACKING") then
             local SAB = self.SAB
             if not SAB then
@@ -578,9 +609,20 @@ function prototype:UpdateData(data)
                 SAB:SetAttribute("*index2", data.id)
                 SAB:SetAttribute("*target-slot2", nil);
             elseif data.type == "TENCH" then
+                -- FIX (Ascension): "target-slot" isn't a secure attribute
+                -- SecureTemplates.lua recognizes on this WotLK 3.3.5a client
+                -- (it's from a newer client's cancelaura handler) - setting it
+                -- fell through to the name-based branch with no spell/rank
+                -- attribute set, calling CancelUnitBuff("player", "") and
+                -- throwing "Usage: CancelUnitBuff(...)" on every click.
+                -- Blizzard's own stock weapon-enchant cancel (BuffFrame.lua's
+                -- TemporaryEnchantFrame_OnClick) calls CancelUnitBuff("player",
+                -- <inventory slot ID>) directly - the same numeric ID already
+                -- computed in data.id here - so route it through the "index"
+                -- attribute instead, exactly like the BUFF branch above.
                 SAB:SetAttribute("*type2", "cancelaura")
-                SAB:SetAttribute("*index2", nil)
-                SAB:SetAttribute("*target-slot2", data.id);
+                SAB:SetAttribute("*index2", data.id)
+                SAB:SetAttribute("*target-slot2", nil);
             else -- data.type == "TRACKING"
                 SAB:SetAttribute("*type2", "OnRightClickTracking")
                 SAB:SetAttribute("*index2", nil)

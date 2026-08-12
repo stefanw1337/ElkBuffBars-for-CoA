@@ -280,9 +280,42 @@ function ElkBuffBars:OnInitialize()
                 BUFF = {},
                 DEBUFF = {},
                 TENCH = {},
-            }
+            },
+            iconcache = {},
+            knownclasses = {}, -- every real/custom class name ever seen (your own alts, plus
+                                -- anyone you've grouped with) -- account-wide, feeds the Class
+                                -- Watch checklist so class names are always picked, never typed
+            buffclasses = { -- name -> {class = true, ...}, per auratype -- account-wide, built
+                BUFF = {},    -- automatically as buffs are observed on units of a known class.
+                DEBUFF = {},  -- Used to narrow "My Self Buffs"/Alt Sets/Class Watch checklists
+                TENCH = {},   -- down to buffs actually relevant to a given class, instead of
+                TRACKING = {}, -- showing every buff ever seen on any alt or groupmate.
+            },
+            buffspellids = { -- name -> spellID, per auratype -- account-wide, learned the same
+                BUFF = {},    -- way as buffclasses. Used to show the buff's real tooltip (icon,
+                DEBUFF = {},  -- description, everything) on mouseover in the filter checklists,
+                TENCH = {},   -- via GameTooltip's native "spell:<id>" hyperlink support.
+                TRACKING = {},
+            },
         },
-    }, true) -- true = defaults to "Default" profile as is good and proper
+    }, true) -- `true` here is AceDB-3.0's built-in "one profile per character" flag -- any
+             -- character that has NEVER logged in with this addon before automatically gets
+             -- its own profile, keyed to its name. Omitting this argument (as this file
+             -- previously did) makes every such character share the one literal profile
+             -- named "Default" instead -- that was the actual cause of buffs/filters
+             -- bleeding across characters (Witch Hunter -> Primalist -> Starcaller, etc.):
+             -- the earlier comment here had AceDB-3.0's own documented behavior backwards.
+             -- Characters that already got stuck on "Default" before this fix (anything
+             -- you've already logged into) will stay on it until you manually give them
+             -- their own profile via the Profiles tab -- this fix only protects brand-new
+             -- characters going forward.
+
+    -- seed the Class Watch checklist from anything already known from past sessions, then
+    -- register this character's own class immediately (so at minimum, every alt you log into
+    -- becomes pickable right away, even before you've grouped with anyone) -- called as
+    -- self: methods (resolved at runtime) since they're defined further down this same file
+    self:SeedKnownClasses()
+    self:AddKnownClass((UnitClass("player")))
 
     -- Clear out old data
     local build = select(2, GetBuildInfo())
@@ -382,6 +415,8 @@ function ElkBuffBars:PLAYER_REGEN_DISABLED()
     for k, v in pairs(self.bargroups) do
         -- remove SecureActionButtons as they can't be moved with the frames in combat
         v:RecycleSABs()
+        -- honor "Hide Group In Combat"
+        v:RefreshContainerVisibility()
     end
 end
 
@@ -389,6 +424,8 @@ function ElkBuffBars:PLAYER_REGEN_ENABLED()
     for k, v in pairs(self.bargroups) do
         -- update bars to recreate the SecureActionButtons
         v:UpdateBars()
+        -- un-hide anything that was only hidden for "Hide Group In Combat"
+        v:RefreshContainerVisibility()
     end
 end
 
@@ -439,6 +476,160 @@ function ElkBuffBars:OnProfileEnable()
             bg.anchorshown = false
         end
         self.db.profile.migrated_configmode_default = true
+    end
+
+    -- one-time migration: "My Self Buffs" and "Self Buff Alternatives" used to be stored flat
+    -- (shared by every class using this profile), which is exactly what let one alt's self
+    -- buffs show up as "missing" on a completely different class sharing the same profile.
+    -- Re-key existing data by class, using whatever db.global.buffclasses has already learned
+    -- about each name: routed to that one class if the tag is unambiguous. If it's ambiguous
+    -- (tagged to 2+ classes) or not tagged at all, we genuinely don't know who it belongs to --
+    -- rather than guessing by duplicating it onto every class (which just moves the bleed
+    -- instead of fixing it -- you'd have to manually un-check it from every OTHER class one by
+    -- one), it's dropped and left for you to re-check on whichever class(es) it actually
+    -- applies to. Self Watcher is meant to be strictly per-class; Group Watcher's class list is
+    -- deliberately the opposite (always shows every class, since that's what it's for).
+    if not self.db.profile.migrated_perclass_selfbuffs then
+        local buffclasses = self.db.global.buffclasses
+        local function soleOwnerClass(auratype, name)
+            local classes = buffclasses[auratype] and buffclasses[auratype][name]
+            if not classes then return nil end
+            local only, n = nil, 0
+            for c in pairs(classes) do n = n + 1; only = c end
+            return (n == 1) and only or nil
+        end
+        for _, bg in ipairs(self.db.profile.bargroups) do
+            local filter = bg.filter
+            if filter then
+                if filter.selfbuffs then
+                    local old = filter.selfbuffs
+                    -- old format's top-level keys are auratype strings (BUFF/DEBUFF/TENCH/
+                    -- TRACKING); new format's top-level keys are class names. Only migrate if
+                    -- we can see it's still the old shape.
+                    if old.BUFF or old.DEBUFF or old.TENCH or old.TRACKING then
+                        local migrated = {}
+                        for auratype, names in pairs(old) do
+                            for name in pairs(names) do
+                                local class = soleOwnerClass(auratype, name)
+                                if class then
+                                    migrated[class] = migrated[class] or {}
+                                    migrated[class][auratype] = migrated[class][auratype] or {}
+                                    migrated[class][auratype][name] = true
+                                end
+                            end
+                        end
+                        filter.selfbuffs = migrated
+                    end
+                end
+                if filter.selfbuffaltgroups then
+                    local old = filter.selfbuffaltgroups
+                    -- old format's top-level keys are numeric slot indexes (1-4); new format's
+                    -- top-level keys are class names.
+                    local isOldFormat = false
+                    for k in pairs(old) do
+                        isOldFormat = (type(k) == "number")
+                        break
+                    end
+                    if isOldFormat then
+                        local migrated = {}
+                        for groupindex, slot in pairs(old) do
+                            -- a whole slot only migrates if every name checked in it agrees on
+                            -- the same single owning class -- a mixed slot can't be assigned
+                            -- anywhere sensible, so it's dropped rather than guessed at.
+                            local agreedClass, conflict = nil, false
+                            for auratype, names in pairs(slot) do
+                                if auratype ~= "count" and auratype ~= "spec" and auratype ~= "onlygrouped" and auratype ~= "shared" then
+                                    for name in pairs(names) do
+                                        local class = soleOwnerClass(auratype, name)
+                                        if not class or (agreedClass and agreedClass ~= class) then
+                                            conflict = true
+                                        else
+                                            agreedClass = class
+                                        end
+                                    end
+                                end
+                            end
+                            if agreedClass and not conflict then
+                                migrated[agreedClass] = migrated[agreedClass] or {}
+                                migrated[agreedClass][groupindex] = slot
+                            end
+                        end
+                        filter.selfbuffaltgroups = migrated
+                    end
+                end
+            end
+        end
+        self.db.profile.migrated_perclass_selfbuffs = true
+    end
+
+    -- one-time cleanup: an earlier version of the migration above (before this fix) duplicated
+    -- ambiguous/untagged self-buff selections onto EVERY known class instead of dropping them,
+    -- which is exactly what let things like Witch Hunter's own Edicts -- and universal buffs
+    -- like Honor -- show up pre-checked on totally unrelated classes (e.g. a Tinkerer). Going
+    -- forward, a name can only ever land under more than one class's bucket as leftover residue
+    -- from that old duplication (each checkbox click now only ever writes to your own class),
+    -- so: if a name is checked under more than one class, keep it only where db.global.
+    -- buffclasses confidently says it belongs, or drop it from all of them if that's still
+    -- ambiguous/unknown -- never leave it duplicated.
+    if not self.db.profile.migrated_perclass_selfbuffs_v2 then
+        local buffclasses = self.db.global.buffclasses
+        local function soleOwnerClass(auratype, name)
+            local classes = buffclasses[auratype] and buffclasses[auratype][name]
+            if not classes then return nil end
+            local only, n = nil, 0
+            for c in pairs(classes) do n = n + 1; only = c end
+            return (n == 1) and only or nil
+        end
+        for _, bg in ipairs(self.db.profile.bargroups) do
+            local filter = bg.filter
+            if filter and filter.selfbuffs then
+                -- find every (auratype, name) present under 2+ classes
+                local presence = {} -- "auratype|name" -> { class1 = true, class2 = true, ... }
+                for class, data in pairs(filter.selfbuffs) do
+                    for auratype, names in pairs(data) do
+                        for name in pairs(names) do
+                            local key = auratype.."|"..name
+                            presence[key] = presence[key] or {}
+                            presence[key][class] = true
+                        end
+                    end
+                end
+                for key, classesPresent in pairs(presence) do
+                    local n = 0
+                    for _ in pairs(classesPresent) do n = n + 1 end
+                    if n > 1 then
+                        local auratype, name = string_match(key, "^(.-)|(.*)$")
+                        local keep = soleOwnerClass(auratype, name)
+                        for class in pairs(classesPresent) do
+                            if class ~= keep then
+                                filter.selfbuffs[class][auratype][name] = nil
+                            end
+                        end
+                    end
+                end
+            end
+            if filter and filter.selfbuffaltgroups then
+                -- same idea, but a whole slot (matched by groupindex) either agrees with one
+                -- class or gets dropped from every class it's duplicated under
+                local presence = {} -- groupindex -> { class1 = true, class2 = true, ... }
+                for class, slots in pairs(filter.selfbuffaltgroups) do
+                    for groupindex in pairs(slots) do
+                        presence[groupindex] = presence[groupindex] or {}
+                        presence[groupindex][class] = true
+                    end
+                end
+                for groupindex, classesPresent in pairs(presence) do
+                    local n = 0
+                    for _ in pairs(classesPresent) do n = n + 1 end
+                    if n > 1 then
+                        for class in pairs(classesPresent) do
+                            filter.selfbuffaltgroups[class][groupindex] = nil
+                        end
+                    end
+                end
+            end
+        end
+        self.db.profile.migrated_perclass_selfbuffs_v2 = true
     end
 
     -- update known names
@@ -528,6 +719,107 @@ function ElkBuffBars:ImportProfile(str)
     self:Print("Settings imported.")
 end
 
+-- Layout-only / Buffs-only export/import: each bar group's config is one table with a
+-- "filter" sub-table (self buffs, alt sets, class watch, white/black list -- everything
+-- buff-selection related) sitting alongside everything else (bars, position, colors, spacing,
+-- anchor text -- the visual "layout"). This splits the two apart, so you can copy your visual
+-- setup to a brand new profile (via Copy From, or a Layout export/import) without also
+-- dragging along whatever buffs happened to be checked on whichever character last touched
+-- that profile. Expected workflow for a clean new character: create+switch to a new profile,
+-- Import Layout (recreates the same bar groups, empty buff selections), then check off that
+-- character's own self buffs from scratch -- or Import Buffs too, if you saved an export from
+-- a same-class alt and want its buff picks as a starting point.
+function ElkBuffBars:ExportLayout()
+    local snapshot = {}
+    for k, v in pairs(self.db.profile) do
+        if k == "bargroups" then
+            local groups = {}
+            for i, bg in ipairs(v) do
+                local copy = {}
+                for bk, bv in pairs(bg) do
+                    if bk ~= "filter" then
+                        copy[bk] = bv
+                    end
+                end
+                groups[i] = copy
+            end
+            snapshot.bargroups = groups
+        else
+            snapshot[k] = v
+        end
+    end
+    return SerializeTable(snapshot)
+end
+
+function ElkBuffBars:ExportBuffs()
+    local snapshot = { bargroups = {} }
+    for i, bg in ipairs(self.db.profile.bargroups) do
+        snapshot.bargroups[i] = { filter = bg.filter }
+    end
+    return SerializeTable(snapshot)
+end
+
+function ElkBuffBars:ImportLayout(str)
+    if not str or string_trim(str) == "" then
+        return
+    end
+    local imported, err = DeserializeString(str)
+    if not imported then
+        self:Print("Import failed: " .. tostring(err))
+        return
+    end
+
+    -- hang onto whatever buff selections already exist (by bar group position), so importing
+    -- a layout never touches your current buff selections
+    local oldFilters = {}
+    if self.db.profile.bargroups then
+        for i, bg in ipairs(self.db.profile.bargroups) do
+            oldFilters[i] = bg.filter
+        end
+    end
+
+    for k in pairs(self.db.profile) do
+        self.db.profile[k] = nil
+    end
+    for k, v in pairs(imported) do
+        self.db.profile[k] = v
+    end
+
+    self.db.profile.bargroups = self.db.profile.bargroups or {}
+    for i, bg in ipairs(self.db.profile.bargroups) do
+        bg.filter = oldFilters[i] or { type = { BUFF = true } }
+    end
+
+    self:OnProfileEnable()
+    self:Print("Layout imported. Buff selections were left untouched.")
+end
+
+function ElkBuffBars:ImportBuffs(str)
+    if not str or string_trim(str) == "" then
+        return
+    end
+    local imported, err = DeserializeString(str)
+    if not imported then
+        self:Print("Import failed: " .. tostring(err))
+        return
+    end
+    if not imported.bargroups or not self.db.profile.bargroups or #self.db.profile.bargroups == 0 then
+        self:Print("Import failed: no bar groups to import buffs into -- import (or set up) a layout first.")
+        return
+    end
+
+    local matched = 0
+    for i, bg in ipairs(imported.bargroups) do
+        if self.db.profile.bargroups[i] and bg.filter then
+            self.db.profile.bargroups[i].filter = bg.filter
+            matched = matched + 1
+        end
+    end
+
+    self:OnProfileEnable()
+    self:Print("Buff selections imported into "..matched.." bar group(s).")
+end
+
 -- refresh layouts when new media is set
 function ElkBuffBars:LibSharedMedia_Update(callback, mediatype, handle)
     if mediatype == "font" or mediatype == "statusbar" then
@@ -604,8 +896,20 @@ end
 -- Keeper's Scrolls, Well Rested, etc.) -- it's separate from Blizzard's BuffFrame, so hiding
 -- BuffFrame alone doesn't touch it. Not a Blizzard/retail global, so it's guarded with a
 -- nil-check rather than the WOW_PROJECT_ID checks used for the other Handle* functions.
+local vanityBuffsHooked = false
 function ElkBuffBars:HandleFrame_Blizzard_VanityBuffs(hide)
     if not VanityBuffs then return end
+    if not vanityBuffsHooked then
+        vanityBuffsHooked = true
+        -- Ascension's own code shows this frame again on its own (e.g. whenever its buffs
+        -- update), which silently undid a one-time :Hide() call every login. Hook :Show()
+        -- itself so it gets forced back shut immediately, for as long as the setting is on.
+        hooksecurefunc(VanityBuffs, "Show", function()
+            if ElkBuffBars.db.profile.hidevanitybuffs then
+                VanityBuffs:Hide()
+            end
+        end)
+    end
     if hide then
         VanityBuffs:Hide()
         hidden_blizzard_frames["VanityBuffs"] = true
@@ -788,17 +1092,213 @@ local knownnames_validate = {
     TRACKING = {},
 }
 
+-- live, per-tab search-box filtering for the BUFF/DEBUFF/TENCH/TRACKING checklists (White
+-- List, Black List, My Self Buffs, Self Buff Alternatives, Class Watch) -- not persisted,
+-- just an in-session UI convenience so a long list of known names can be narrowed down.
+-- searchkey is a caller-chosen unique string identifying which tab's search box this is.
+local searchterms = {}
 
-function ElkBuffBars:AddKnownName(auratype, name)
+
+-- builds a reusable "search box" input entry for a given searchkey; place it in any tab that
+-- has BUFF/DEBUFF/TENCH/TRACKING checklists built by BuildNameChecklist below, and it narrows
+-- all of them down together as you type. NOTE: in this AceConfig-3.0's sort, NEGATIVE order
+-- values sort to the very END of the list, not the front (the opposite of what you'd expect) --
+-- so order 0 here is deliberately the lowest NON-negative value, keeping it ahead of
+-- spec/count/onlygrouped (0.1/0.2/0.3) and the BUFF/DEBUFF/TENCH/TRACKING sections (1-4).
+local function BuildSearchBoxOption(searchkey)
+    return {
+        order = 0,
+        type = "input",
+        width = "full",
+        name = L["OPTIONS_GROUP_FILTER_SEARCH_NAME"],
+        desc = L["OPTIONS_GROUP_FILTER_SEARCH_DESC"],
+        get = function(info) return searchterms[searchkey] or "" end,
+        set = function(info, v)
+            searchterms[searchkey] = v
+            LibStub("AceConfigRegistry-3.0"):NotifyChange(ELKBUFFBARS)
+        end,
+    }
+end
+
+------------------------------------------------------------------------
+-- Turns a BUFF/DEBUFF/TENCH/TRACKING name list into individual checkboxes (one per buff)
+-- instead of one compact multiselect grid -- this is what lets each entry carry its own real
+-- mouseover tooltip (WoW's own "spell:<id>" hyperlink, same as hovering a spell link in chat)
+-- instead of one shared description for the whole list. Visibility (search term + class
+-- restriction) is re-checked live via "hidden", and new entries get dropped in on the fly as
+-- new buffs are learned -- see the toggleRegistry loop at the end of AddKnownName above.
+
+-- auratype -> list of { args = <table>, searchkey, classRestrict, get = fn(name), set =
+-- fn(name, value) } for every checklist section built so far, so a newly-learned buff (or a
+-- name that just picked up a spellid, for the tooltip) can be patched into all of them live,
+-- without requiring a UI reload
+local toggleRegistry = { BUFF = {}, DEBUFF = {}, TENCH = {}, TRACKING = {} }
+local nextDynamicOrder = 10000 -- new mid-session discoveries just get tacked on the end
+
+local function NameToggleHidden(auratype, name, searchkey, classRestrict)
+    if classRestrict then
+        local buffclasses = ElkBuffBars.db.global.buffclasses[auratype]
+        local classes = buffclasses and buffclasses[name]
+        if classes and not classes[classRestrict] then
+            return true
+        end
+    end
+    local term = searchterms[searchkey]
+    if term and term ~= "" and not string_find(strlower(name), strlower(term), 1, true) then
+        return true
+    end
+    return false
+end
+
+-- pulls a buff's real tooltip text (whatever WoW itself would show) by briefly pointing a
+-- hidden scanning tooltip at its spellID and reading the lines back out as plain text. Used
+-- instead of AceConfig's "tooltipHyperlink" field -- that field isn't recognized by every
+-- copy of AceConfigRegistry-3.0 that might be active account-wide (LibStub only keeps one
+-- shared copy of each library across ALL addons, and an older copy from another addon can
+-- "win" over the one bundled here), and an unrecognized field hard-crashes the whole options
+-- window instead of degrading gracefully. Plain "desc" text is safe everywhere.
+local scanTooltip = CreateFrame("GameTooltip", "ElkBuffBarsScanTooltip", nil, "GameTooltipTemplate")
+scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+local spellDescCache = {}
+
+local function GetSpellDescription(spellid)
+    local cached = spellDescCache[spellid]
+    if cached ~= nil then
+        return cached or nil
+    end
+    scanTooltip:ClearLines()
+    scanTooltip:SetSpellByID(spellid)
+    local lines = {}
+    for i = 2, scanTooltip:NumLines() do
+        local fs = _G["ElkBuffBarsScanTooltipTextLeft"..i]
+        local text = fs and fs:GetText()
+        if text and text ~= "" then
+            table_insert(lines, text)
+        end
+    end
+    local desc = (#lines > 0) and table.concat(lines, "\n") or false
+    spellDescCache[spellid] = desc -- cache misses too (as false), so we don't rescan every hover
+    return desc or nil
+end
+
+local function BuildNameToggle(auratype, name, searchkey, classRestrict, getFn, setFn, order)
+    local spellid = ElkBuffBars.db.global.buffspellids[auratype][name]
+    return {
+        order = order,
+        type = "toggle",
+        width = "double",
+        name = name,
+        desc = spellid and function() return GetSpellDescription(spellid) end or nil,
+        hidden = function() return NameToggleHidden(auratype, name, searchkey, classRestrict) end,
+        get = function() return getFn(name) end,
+        set = function(info, value) setFn(name, value) end,
+    }
+end
+
+-- builds the toggle-per-name args for one auratype section (e.g. the "Buff" group inside "My
+-- Self Buffs"), wrapped in its own inline group so it still reads as a labeled section same as
+-- before. classRestrict (optional): only show names never seen on any class, or seen on this
+-- one specifically (see NameToggleHidden above for the exact rule).
+local function BuildNameChecklist(auratype, searchkey, classRestrict, getFn, setFn, order, sectionName)
+    local args = {}
+    for i, name in ipairs(knownnames_validate[auratype]) do
+        args[name] = BuildNameToggle(auratype, name, searchkey, classRestrict, getFn, setFn, i)
+    end
+    table_insert(toggleRegistry[auratype], {
+        args = args, searchkey = searchkey, classRestrict = classRestrict, get = getFn, set = setFn,
+    })
+    return {
+        order = order,
+        type = "group",
+        inline = true,
+        name = sectionName,
+        args = args,
+    }
+end
+
+-- every real/custom class name ever seen (this session's seed comes from
+-- db.global.knownclasses in OnInitialize; grows automatically as new classes are
+-- encountered, either your own alts logging in or party/raid members during scans)
+local knownclasses_validate = {}
+
+-- every Ascension class known to exist, hardcoded so Group Watcher always offers the full
+-- roster from the very first login -- not just whichever classes you happen to have already
+-- played or grouped with. Anything actually encountered that ISN'T in this list (a class added
+-- to the server after this list was written) still gets picked up automatically via
+-- AddKnownClass, same as before -- this list is a floor, not a ceiling.
+local ASCENSION_CLASSES = {
+    "Barbarian", "Bloodmage", "Chronomancer", "Cultist", "Felsworn", "Guardian",
+    "Knight of Xoroth", "Necromancer", "Primalist", "Pyromancer", "Ranger", "Reaper",
+    "Runemaster", "Starcaller", "Stormbringer", "Sun Cleric", "Templar", "Tinker",
+    "Venomancer", "Witch Doctor", "Witch Hunter",
+}
+
+-- rebuilds the (fresh-this-session, empty) local knownclasses_validate array from the
+-- persisted, account-wide db.global.knownclasses set PLUS the full hardcoded roster above --
+-- called once from OnInitialize
+function ElkBuffBars:SeedKnownClasses()
+    local seen = {}
+    for _, name in ipairs(ASCENSION_CLASSES) do
+        if not seen[name] then
+            seen[name] = true
+            table_insert(knownclasses_validate, name)
+        end
+        self.db.global.knownclasses[name] = true
+    end
+    for name in pairs(self.db.global.knownclasses) do
+        if not seen[name] then
+            seen[name] = true
+            table_insert(knownclasses_validate, name)
+        end
+    end
+    table_sort(knownclasses_validate)
+end
+
+function ElkBuffBars:AddKnownClass(name)
+    if not name or name == "" then
+        return
+    end
     if string_find(name, "[%c\127]") then
         -- name contained control characters; would break AceConfig
         return
     end
-    if self.knownnames[auratype] and not self.knownnames[auratype][name] then
+    if not self.db.global.knownclasses[name] then
+        self.db.global.knownclasses[name] = true
+        table_insert(knownclasses_validate, name)
+        table_sort(knownclasses_validate)
+    end
+end
+
+function ElkBuffBars:AddKnownName(auratype, name, class, spellid)
+    if string_find(name, "[%c\127]") then
+        -- name contained control characters; would break AceConfig
+        return
+    end
+    if class and class ~= "" then
+        local bc = self.db.global.buffclasses[auratype]
+        bc[name] = bc[name] or {}
+        bc[name][class] = true
+    end
+    if spellid then
+        self.db.global.buffspellids[auratype][name] = spellid
+    end
+    local isNew = self.knownnames[auratype] and not self.knownnames[auratype][name]
+    if isNew then
         self.knownnames[auratype][name] = true
         AO_buffsettings.args[auratype].args[name] = self:GetNameOptions(auratype, name)
         table_insert(knownnames_validate[auratype], name)
         table_sort(knownnames_validate[auratype])
+    end
+    -- drop a new toggle into every already-built "My Self Buffs"/Alt Set/Class Watch/
+    -- White-Black-List checklist that covers this auratype, so a buff discovered mid-session
+    -- shows up as a selectable option immediately, without needing a UI reload. Also used to
+    -- pick up a newly-learned spellid (for the mouseover tooltip) on a name that was already
+    -- known but didn't have one yet.
+    for _, reg in ipairs(toggleRegistry[auratype]) do
+        if isNew or reg.args[name] == nil or (spellid and not reg.args[name].desc) then
+            nextDynamicOrder = nextDynamicOrder + 1
+            reg.args[name] = BuildNameToggle(auratype, name, reg.searchkey, reg.classRestrict, reg.get, reg.set, reg.args[name] and reg.args[name].order or nextDynamicOrder)
+        end
     end
 end
 
@@ -825,6 +1325,43 @@ function ElkBuffBars:UpdateKnownNames()
             for auratype, data in pairs(bg.filter.names_exclude) do
                 for name in pairs(data) do
                     self:AddKnownName(auratype, name)
+                end
+            end
+        end
+        if bg.filter.selfbuffs then
+            -- keyed by class now (see migrated_perclass_selfbuffs in OnProfileEnable) -- passing
+            -- the class here backfills db.global.buffclasses for names that were only ever
+            -- selected in "My Self Buffs" and never actually observed live via UNIT_AURA (e.g.
+            -- you're not currently grouped with anyone who'd show it), which is also what keeps
+            -- them properly hidden from OTHER classes' Group Watcher/checklists going forward.
+            for classname, data in pairs(bg.filter.selfbuffs) do
+                for auratype, names in pairs(data) do
+                    for name in pairs(names) do
+                        self:AddKnownName(auratype, name, classname)
+                    end
+                end
+            end
+        end
+        if bg.filter.selfbuffaltgroups then
+            -- also keyed by class now -- same backfill reasoning as selfbuffs above.
+            for classname, slots in pairs(bg.filter.selfbuffaltgroups) do
+                for _, slot in pairs(slots) do
+                    for auratype, data in pairs(slot) do
+                        if auratype ~= "count" and auratype ~= "spec" and auratype ~= "onlygrouped" and auratype ~= "shared" then
+                            for name in pairs(data) do
+                                self:AddKnownName(auratype, name, classname)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if bg.filter.classbuffs then
+            for classname, byclass in pairs(bg.filter.classbuffs) do
+                for auratype, data in pairs(byclass) do
+                    for name in pairs(data) do
+                        self:AddKnownName(auratype, name, classname)
+                    end
                 end
             end
         end
@@ -897,6 +1434,9 @@ local DEFAULT_LAYOUT = {
     },
     filter = {
         type = {},
+        showmissing = false,						-- true, false
+        whitelistisfilter = true,					-- true, false -- true = White List restricts what's shown (classic behavior); false = White List is only consulted for Show Missing, doesn't restrict the group's normal display
+        alertblacklisted = false,					-- true, false -- flags (instead of hiding) a Black List name if it's currently active
     },
     alpha			= 1,							-- alpha value
     scale			= 1,
@@ -908,6 +1448,9 @@ local DEFAULT_LAYOUT = {
     anchortext		= "unknown bargroup",			-- <string>
     anchorshown		= false,						-- true, false
     hideanchorwhenempty = false,					-- true, false
+    hideincombat	= false,						-- true, false -- hides the WHOLE group's bars while in combat
+    hidewhennomissing = false,						-- true, false -- hides the WHOLE group unless Show Missing has a red bar up
+    hidewhenallmissing = false,					-- true, false -- hides the WHOLE group if every tracked name is missing (0 active)
 }
 
 -- resets corrupt entries in the given layout to default values; returns a now valid layout
@@ -1164,11 +1707,17 @@ local function hasRangedItemEquipped()
     return rangedSlot ~= nil and GetInventoryItemID("player", rangedSlot) ~= nil
 end
 
+local function hasOffhandItemEquipped()
+    local offhandSlot = TENCH_INVENTORYSLOT[2]
+    return offhandSlot ~= nil and GetInventoryItemID("player", offhandSlot) ~= nil
+end
+
 function ElkBuffBars:ScanData_TENCH_Launcher()
-    -- Ascension's ranged-weapon "gadget" buffs (e.g. Stim Rounds) never show up in
-    -- GetWeaponEnchantInfo(), so also keep the poller running whenever a ranged weapon is
-    -- equipped at all -- otherwise the timer would never even start for those buffs.
-    if hasTEnch(GetWeaponEnchantInfo()) or hasRangedItemEquipped() then
+    -- Ascension's ranged-weapon "gadget" buffs (e.g. Stim Rounds) and shield "gadget" buffs
+    -- never show up in GetWeaponEnchantInfo(), so also keep the poller running whenever a
+    -- ranged weapon or an off-hand item (shield) is equipped at all -- otherwise the timer
+    -- would never even start for those buffs.
+    if hasTEnch(GetWeaponEnchantInfo()) or hasRangedItemEquipped() or hasOffhandItemEquipped() then
         if self.timer_TENCH == nil then
             self.timer_TENCH = self:ScheduleRepeatingTimer("ScanData_TENCH_Worker", .5)
             self:ScanData_TENCH_Worker()
@@ -1181,10 +1730,11 @@ function ElkBuffBars:ScanData_TENCH_Launcher()
 end
 
 function ElkBuffBars:ScanData_TENCH_Worker()
-    -- hasTEnchUpdate() alone would never be true for a ranged gadget buff (GetWeaponEnchantInfo
-    -- never reflects it, so it never "changes"), so also force a rescan every tick while a
-    -- ranged weapon is equipped, to keep its tooltip-scanned duration fresh.
-    if hasTEnchUpdate(GetWeaponEnchantInfo()) or hasRangedItemEquipped() then
+    -- hasTEnchUpdate() alone would never be true for a ranged/shield gadget buff
+    -- (GetWeaponEnchantInfo never reflects it, so it never "changes"), so also force a
+    -- rescan every tick while a ranged weapon or off-hand item is equipped, to keep its
+    -- tooltip-scanned duration fresh.
+    if hasTEnchUpdate(GetWeaponEnchantInfo()) or hasRangedItemEquipped() or hasOffhandItemEquipped() then
         self:ScanData_TENCH()
         self:UpdateGroups()
     end
@@ -1219,7 +1769,7 @@ function ElkBuffBars:ScanData_TENCH_Helper(...)
 
             local id = TENCH_INVENTORYSLOT[itemIndex]
             local name, rank = self:GetTempBuffName(id, enchantId)
-            self:AddKnownName("TENCH", name)
+            self:AddKnownName("TENCH", name, (UnitClass("player")))
     --		if rank then
     --			rank = string_match(rank, PATTERN_RANK)
     --		end
@@ -1280,7 +1830,7 @@ function ElkBuffBars:ScanData_TENCH_Helper(...)
         if not alreadyHandled then
             local gadgetName, gadgetSeconds = self:GetGadgetBuffInfo(rangedSlot)
             if gadgetName then
-                self:AddKnownName("TENCH", gadgetName)
+                self:AddKnownName("TENCH", gadgetName, (UnitClass("player")))
 
                 local dt = GetDataTable()
                 dt.id				= rangedSlot
@@ -1308,6 +1858,50 @@ function ElkBuffBars:ScanData_TENCH_Helper(...)
         end
     end
 
+    -- Same story for shields: some Ascension shields grant a "gadget"-style buff (e.g. a
+    -- block/reflect proc) that never comes through GetWeaponEnchantInfo() either, since that
+    -- API only reports classic temporary weapon enchants (poisons, sharpening stones, etc.).
+    -- Fall back to scanning the off-hand item's own tooltip the same way as the ranged slot.
+    local offhandSlot = TENCH_INVENTORYSLOT[2]
+    if offhandSlot then
+        local alreadyHandled = false
+        for _, dt in ipairs(self.tenchdata) do
+            if dt.id == offhandSlot then
+                alreadyHandled = true
+                break
+            end
+        end
+        if not alreadyHandled then
+            local gadgetName, gadgetSeconds = self:GetGadgetBuffInfo(offhandSlot)
+            if gadgetName then
+                self:AddKnownName("TENCH", gadgetName, (UnitClass("player")))
+
+                local dt = GetDataTable()
+                dt.id				= offhandSlot
+                dt.spellid			= nil
+                dt.name				= self.db.profile.nameoverride.TENCH[gadgetName] or gadgetName
+                dt.realname			= gadgetName
+                dt.rank				= nil
+                dt.type				= self.db.profile.typeoverride.TENCH[gadgetName] or "TENCH"
+                dt.realtype			= "TENCH"
+                dt.debufftype		= nil
+                dt.expirytime		= gadgetSeconds + value_GetTime
+                dt.timemax			= gadgetSeconds
+                dt.timeMod			= 0
+                dt.untilcancelled	= nil
+                dt.charges			= 0
+                dt.maxcharges		= nil
+                dt.icon				= GetInventoryItemTexture("player", offhandSlot)
+                dt.ismine			= true
+                dt.casterName		= GetUnitName("player", true) or UNKNOWN
+                dt.casterClass		= (UnitClassBase("player")) or ""
+                dt.canStealOrPurge	= false
+
+                table_insert(self.tenchdata, dt)
+            end
+        end
+    end
+
     scan_happened.player = true
 end
 
@@ -1323,7 +1917,7 @@ function ElkBuffBars:ScanData_TRACKING()
 
     if CURRENT_EXPANSION_LEVEL >= (LE_EXPANSION_BURNING_CRUSADE or 1) then
         local name = "Tracking"
-        self:AddKnownName("TRACKING", name)
+        self:AddKnownName("TRACKING", name, (UnitClass("player")))
         local dt = GetDataTable()
         dt.id				= 1
         dt.spellid			= nil
@@ -1351,7 +1945,7 @@ function ElkBuffBars:ScanData_TRACKING()
     local icon = GetTrackingTexture()
     if icon then
         local name = self:GetTrackingName()
-        self:AddKnownName("TRACKING", name)
+        self:AddKnownName("TRACKING", name, (UnitClass("player")))
         local dt = GetDataTable()
         dt.id				= 1
         dt.spellid			= nil
@@ -1404,7 +1998,7 @@ function ElkBuffBars:ScanData_UnitAura(unit, auratype)
         end
         if not texture then break end
 --		print(unit, name, tostring(name.utf8len), tostring(issecure()))
-        self:AddKnownName(auratype, name)
+        self:AddKnownName(auratype, name, (UnitClass(unit)), spellId)
         count = count or 0
         if count > 1 and (type(maxcharges[name]) ~= "number" or maxcharges[name] < count) then
             -- (type-checked instead of a plain nil check: sessions before the UNITAURA_HAS_RANK
@@ -1947,6 +2541,63 @@ function ElkBuffBars:GetOptions()
                                     end
                                 end,
                             },
+                            hideincombat = {
+                                order = 102.6,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_HIDEINCOMBAT_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_HIDEINCOMBAT_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.hideincombat then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.hideincombat = value
+                                        bg:RefreshContainerVisibility()
+                                    end
+                                end,
+                            },
+                            hidewhennomissing = {
+                                order = 102.7,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_HIDEWHENNOMISSING_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_HIDEWHENNOMISSING_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.hidewhennomissing then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.hidewhennomissing = value
+                                        bg:RefreshContainerVisibility()
+                                    end
+                                end,
+                            },
+                            hidewhenallmissing = {
+                                order = 102.8,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_HIDEWHENALLMISSING_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_HIDEWHENALLMISSING_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.hidewhenallmissing then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.hidewhenallmissing = value
+                                        bg:RefreshContainerVisibility()
+                                    end
+                                end,
+                            },
                         },
                     },
                 },
@@ -1957,6 +2608,11 @@ function ElkBuffBars:GetOptions()
                 name = L["OPTIONS_EXPORTIMPORT_NAME"],
                 desc = L["OPTIONS_EXPORTIMPORT_DESC"],
                 args = {
+                    splitdesc = {
+                        order = 50,
+                        type = "description",
+                        name = L["OPTIONS_EXPORTIMPORT_SPLIT_DESC"],
+                    },
                     exportdesc = {
                         order = 100,
                         type = "description",
@@ -1965,7 +2621,7 @@ function ElkBuffBars:GetOptions()
                     exportstring = {
                         order = 101,
                         type = "input",
-                        multiline = 14,
+                        multiline = 10,
                         width = "full",
                         name = L["OPTIONS_EXPORT_NAME"],
                         get = function() return ElkBuffBars:ExportProfile() end,
@@ -1979,13 +2635,89 @@ function ElkBuffBars:GetOptions()
                     importstring = {
                         order = 201,
                         type = "input",
-                        multiline = 14,
+                        multiline = 10,
                         width = "full",
                         name = L["OPTIONS_IMPORT_NAME"],
                         get = function() return "" end,
                         set = function(info, value)
                             ElkBuffBars:ImportProfile(value)
                         end,
+                    },
+                    layoutgroup = {
+                        order = 300,
+                        type = "group",
+                        inline = true,
+                        name = L["OPTIONS_EXPORTIMPORT_LAYOUT_NAME"],
+                        args = {
+                            exportdesc = {
+                                order = 100,
+                                type = "description",
+                                name = L["OPTIONS_EXPORT_LAYOUT_DESC"],
+                            },
+                            exportstring = {
+                                order = 101,
+                                type = "input",
+                                multiline = 8,
+                                width = "full",
+                                name = L["OPTIONS_EXPORT_NAME"],
+                                get = function() return ElkBuffBars:ExportLayout() end,
+                                set = function() end,
+                            },
+                            importdesc = {
+                                order = 200,
+                                type = "description",
+                                name = L["OPTIONS_IMPORT_LAYOUT_DESC"],
+                            },
+                            importstring = {
+                                order = 201,
+                                type = "input",
+                                multiline = 8,
+                                width = "full",
+                                name = L["OPTIONS_IMPORT_NAME"],
+                                get = function() return "" end,
+                                set = function(info, value)
+                                    ElkBuffBars:ImportLayout(value)
+                                end,
+                            },
+                        },
+                    },
+                    buffsgroup = {
+                        order = 400,
+                        type = "group",
+                        inline = true,
+                        name = L["OPTIONS_EXPORTIMPORT_BUFFS_NAME"],
+                        args = {
+                            exportdesc = {
+                                order = 100,
+                                type = "description",
+                                name = L["OPTIONS_EXPORT_BUFFS_DESC"],
+                            },
+                            exportstring = {
+                                order = 101,
+                                type = "input",
+                                multiline = 8,
+                                width = "full",
+                                name = L["OPTIONS_EXPORT_NAME"],
+                                get = function() return ElkBuffBars:ExportBuffs() end,
+                                set = function() end,
+                            },
+                            importdesc = {
+                                order = 200,
+                                type = "description",
+                                name = L["OPTIONS_IMPORT_BUFFS_DESC"],
+                            },
+                            importstring = {
+                                order = 201,
+                                type = "input",
+                                multiline = 8,
+                                width = "full",
+                                name = L["OPTIONS_IMPORT_NAME"],
+                                get = function() return "" end,
+                                set = function(info, value)
+                                    ElkBuffBars:ImportBuffs(value)
+                                end,
+                            },
+                        },
                     },
                 },
             },
@@ -2053,6 +2785,11 @@ function ElkBuffBars:GetNameOptions(auratype, name)
     }
 end
 
+-- forward-declared (defined further below, near BuildClassWatchOptions) so SetSelfBuffFilter/
+-- SetSelfBuffAltGroupFilter can auto-link a checked self buff into Group Watcher for your own
+-- class -- see the comment on that auto-link below for why.
+local SetClassTracked, SetClassBuffFilter
+
 local function SetNameFilter(groupid, white, auratype, auraname, value)
     local bg = ElkBuffBars.bargroups[groupid]
     local filter = bg.layout.filter
@@ -2089,6 +2826,367 @@ end
 
 function ElkBuffBars:AddAuraToBlacklist(groupid, auratype, auraname)
     SetNameFilter(groupid, false, auratype, auraname, true)
+end
+
+-- "My Self Buffs" and "Self Buff Alternatives" (below) are both keyed by class first
+-- (UnitClass("player")), so that two different classes sharing the same bar-group profile
+-- each get their own independent set of self-buff selections instead of bleeding into each
+-- other -- see migrated_perclass_selfbuffs in OnProfileEnable for the one-time migration of
+-- data saved before this separation existed.
+--
+-- Checking a name here also auto-checks it under Group Watcher for your own class, in this
+-- same bar group (and auto-tracks your own class there too, since otherwise the entry
+-- wouldn't be consulted at all -- see classestracked in GetClassWatchGroups). A self buff you
+-- give yourself is, by definition, something your class provides -- so if you're grouped with
+-- ANOTHER member of your own class, Group Watcher should already know to check them for it,
+-- without you having to configure the exact same name twice. This is one-directional and
+-- additive only: unchecking a self buff does NOT remove it from Group Watcher (it may still be
+-- legitimately wanted there even if you personally stopped tracking it on yourself), and
+-- Group Watcher can always be given MORE names beyond whatever's mirrored from here.
+local function SetSelfBuffFilter(groupid, auratype, auraname, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    local class = (UnitClass("player"))
+    if value then
+        filter.selfbuffs = filter.selfbuffs or {}
+        filter.selfbuffs[class] = filter.selfbuffs[class] or {}
+        filter.selfbuffs[class][auratype] = filter.selfbuffs[class][auratype] or {}
+        filter.selfbuffs[class][auratype][auraname] = true
+        -- picking this as a self buff on this class IS a positive class tag, even if you've
+        -- never actually seen it observed live on anyone (e.g. it's a world buff you don't
+        -- have up right now) -- keeps it properly hidden from other classes' checklists.
+        ElkBuffBars:AddKnownName(auratype, auraname, class)
+        SetClassTracked(groupid, class, true)
+        SetClassBuffFilter(groupid, class, auratype, auraname, true)
+    elseif filter.selfbuffs and filter.selfbuffs[class] and filter.selfbuffs[class][auratype] then
+        filter.selfbuffs[class][auratype][auraname] = nil
+        local hasdata = false
+        for _ in pairs(filter.selfbuffs[class][auratype]) do
+            hasdata = true
+            break
+        end
+        if not hasdata then
+            filter.selfbuffs[class][auratype] = nil
+        end
+    end
+    bg:UpdateData()
+end
+
+local SELFALTGROUP_COUNT = 4 -- number of "Self Buff Alternatives" checkbox slots per bar group
+
+local function SetSelfBuffAltGroupFilter(groupid, groupindex, auratype, auraname, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    local class = (UnitClass("player"))
+    if value then
+        filter.selfbuffaltgroups = filter.selfbuffaltgroups or {}
+        filter.selfbuffaltgroups[class] = filter.selfbuffaltgroups[class] or {}
+        filter.selfbuffaltgroups[class][groupindex] = filter.selfbuffaltgroups[class][groupindex] or {}
+        filter.selfbuffaltgroups[class][groupindex][auratype] = filter.selfbuffaltgroups[class][groupindex][auratype] or {}
+        filter.selfbuffaltgroups[class][groupindex][auratype][auraname] = true
+        ElkBuffBars:AddKnownName(auratype, auraname, class)
+        -- same auto-link into Group Watcher as SetSelfBuffFilter above -- an alt-set flavor is
+        -- still a self buff your class provides.
+        SetClassTracked(groupid, class, true)
+        SetClassBuffFilter(groupid, class, auratype, auraname, true)
+    elseif filter.selfbuffaltgroups and filter.selfbuffaltgroups[class] and filter.selfbuffaltgroups[class][groupindex] and filter.selfbuffaltgroups[class][groupindex][auratype] then
+        filter.selfbuffaltgroups[class][groupindex][auratype][auraname] = nil
+        local hasdata = false
+        for _ in pairs(filter.selfbuffaltgroups[class][groupindex][auratype]) do
+            hasdata = true
+            break
+        end
+        if not hasdata then
+            filter.selfbuffaltgroups[class][groupindex][auratype] = nil
+        end
+    end
+    bg:UpdateData()
+end
+
+local function SetSelfBuffAltGroupCount(groupid, groupindex, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    local class = (UnitClass("player"))
+    filter.selfbuffaltgroups = filter.selfbuffaltgroups or {}
+    filter.selfbuffaltgroups[class] = filter.selfbuffaltgroups[class] or {}
+    filter.selfbuffaltgroups[class][groupindex] = filter.selfbuffaltgroups[class][groupindex] or {}
+    value = tonumber(value)
+    filter.selfbuffaltgroups[class][groupindex].count = (value and value > 1) and value or nil -- nil = 1 (default)
+    bg:UpdateData()
+end
+
+local function SetSelfBuffAltGroupSpec(groupid, groupindex, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    local class = (UnitClass("player"))
+    filter.selfbuffaltgroups = filter.selfbuffaltgroups or {}
+    filter.selfbuffaltgroups[class] = filter.selfbuffaltgroups[class] or {}
+    filter.selfbuffaltgroups[class][groupindex] = filter.selfbuffaltgroups[class][groupindex] or {}
+    filter.selfbuffaltgroups[class][groupindex].spec = (value and value ~= 0) and value or nil -- nil = any spec
+    bg:UpdateData()
+end
+
+local function SetSelfBuffAltGroupOnlyGrouped(groupid, groupindex, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    local class = (UnitClass("player"))
+    filter.selfbuffaltgroups = filter.selfbuffaltgroups or {}
+    filter.selfbuffaltgroups[class] = filter.selfbuffaltgroups[class] or {}
+    filter.selfbuffaltgroups[class][groupindex] = filter.selfbuffaltgroups[class][groupindex] or {}
+    filter.selfbuffaltgroups[class][groupindex].onlygrouped = value or nil
+    bg:UpdateData()
+end
+
+-- when on, this set counts as satisfied if EITHER you or another party/raid member of your
+-- own class currently has one of its names active -- not just you. This is what lets a set of
+-- either-or class buffs (e.g. three flavors of the same buff, only one of which any single
+-- Witch Hunter can have up at once) get spread across multiple same-class members in a group:
+-- if another Witch Hunter already has one flavor up, this set treats that flavor as covered
+-- and only asks you for one of the remaining ones. Has no effect while solo (nobody else to
+-- check), so it's always safe to leave on.
+local function SetSelfBuffAltGroupShared(groupid, groupindex, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    local class = (UnitClass("player"))
+    filter.selfbuffaltgroups = filter.selfbuffaltgroups or {}
+    filter.selfbuffaltgroups[class] = filter.selfbuffaltgroups[class] or {}
+    filter.selfbuffaltgroups[class][groupindex] = filter.selfbuffaltgroups[class][groupindex] or {}
+    filter.selfbuffaltgroups[class][groupindex].shared = value or nil
+    bg:UpdateData()
+end
+
+-- builds the "Self Buff Alternatives" checkbox sub-tabs: for self-only buffs where only one
+-- of several can be active at a time (e.g. two alternate versions of the same class's self
+-- buff) -- having ANY ONE of a set's checked names active satisfies that whole set, same as
+-- Class Watch, but never gated by group presence since these are self-buffs. "How Many
+-- Needed" raises the bar above 1 -- e.g. 3 possible Edicts where you always have your own up
+-- but also want to know if a grouped Witch Hunter has given you a DIFFERENT one: check all 3,
+-- set the count to 2, and it only shows satisfied once 2 distinct ones (from any source) are
+-- active, with the missing bar naming only the one(s) you don't have yet.
+local function BuildSelfBuffAltGroupsOptions(id)
+    -- filter.selfbuffaltgroups is keyed by class first (see SetSelfBuffAltGroupFilter etc.
+    -- above), so a Chronomancer and a Witch Hunter sharing this same bar group's profile each
+    -- get their own independent 4 slots instead of overwriting each other's.
+    local myClass = (UnitClass("player"))
+    local args = {}
+    for gi = 1, SELFALTGROUP_COUNT do
+        args[tostring(gi)] = {
+            order = gi,
+            type = "group",
+            name = format(L["OPTIONS_GROUP_FILTER_SELFALTGROUP_NAME"], gi),
+            desc = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_DESC"],
+            args = {
+                spec = {
+                    order = 0.1,
+                    type = "select",
+                    name = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_NAME"],
+                    desc = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_DESC"],
+                    values = {
+                        [0] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_ANY"],
+                        [1] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_SPEC1"],
+                        [2] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_SPEC2"],
+                    },
+                    get = function(info)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return (ag and ag[gi] and ag[gi].spec) or 0
+                    end,
+                    set = function(info, v) SetSelfBuffAltGroupSpec(id, gi, v) end,
+                },
+                count = {
+                    order = 0.2,
+                    type = "input",
+                    name = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_COUNT_NAME"],
+                    desc = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_COUNT_DESC"],
+                    pattern = "^%d+$",
+                    get = function(info)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return tostring(ag and ag[gi] and ag[gi].count or 1)
+                    end,
+                    set = function(info, v) SetSelfBuffAltGroupCount(id, gi, v) end,
+                },
+                onlygrouped = {
+                    order = 0.3,
+                    type = "toggle",
+                    width = "full",
+                    name = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_ONLYGROUPED_NAME"],
+                    desc = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_ONLYGROUPED_DESC"],
+                    get = function(info)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return (ag and ag[gi] and ag[gi].onlygrouped) or false
+                    end,
+                    set = function(info, v) SetSelfBuffAltGroupOnlyGrouped(id, gi, v) end,
+                },
+                shared = {
+                    order = 0.4,
+                    type = "toggle",
+                    width = "full",
+                    name = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SHARED_NAME"],
+                    desc = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SHARED_DESC"],
+                    get = function(info)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return (ag and ag[gi] and ag[gi].shared) or false
+                    end,
+                    set = function(info, v) SetSelfBuffAltGroupShared(id, gi, v) end,
+                },
+                search = BuildSearchBoxOption("selfaltgroup_"..id.."_"..gi),
+                BUFF = BuildNameChecklist("BUFF", "selfaltgroup_"..id.."_"..gi, myClass,
+                    function(name)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return ag and ag[gi] and ag[gi].BUFF and ag[gi].BUFF[name] or false
+                    end,
+                    function(name, value) SetSelfBuffAltGroupFilter(id, gi, "BUFF", name, value) end,
+                    1, L["AURATYPE_BUFF"]),
+                DEBUFF = BuildNameChecklist("DEBUFF", "selfaltgroup_"..id.."_"..gi, myClass,
+                    function(name)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return ag and ag[gi] and ag[gi].DEBUFF and ag[gi].DEBUFF[name] or false
+                    end,
+                    function(name, value) SetSelfBuffAltGroupFilter(id, gi, "DEBUFF", name, value) end,
+                    2, L["AURATYPE_DEBUFF"]),
+                TENCH = BuildNameChecklist("TENCH", "selfaltgroup_"..id.."_"..gi, myClass,
+                    function(name)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return ag and ag[gi] and ag[gi].TENCH and ag[gi].TENCH[name] or false
+                    end,
+                    function(name, value) SetSelfBuffAltGroupFilter(id, gi, "TENCH", name, value) end,
+                    3, L["AURATYPE_TENCH"]),
+                TRACKING = BuildNameChecklist("TRACKING", "selfaltgroup_"..id.."_"..gi, myClass,
+                    function(name)
+                        local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
+                        ag = ag and ag[myClass]
+                        return ag and ag[gi] and ag[gi].TRACKING and ag[gi].TRACKING[name] or false
+                    end,
+                    function(name, value) SetSelfBuffAltGroupFilter(id, gi, "TRACKING", name, value) end,
+                    4, L["AURATYPE_TRACKING"]),
+            },
+        }
+    end
+    return args
+end
+
+function SetClassTracked(groupid, classname, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    if value then
+        filter.classestracked = filter.classestracked or {}
+        filter.classestracked[classname] = true
+    elseif filter.classestracked then
+        filter.classestracked[classname] = nil
+    end
+    bg:UpdateData()
+end
+
+function SetClassBuffFilter(groupid, classname, auratype, auraname, value)
+    local bg = ElkBuffBars.bargroups[groupid]
+    local filter = bg.layout.filter
+    if value then
+        filter.classbuffs = filter.classbuffs or {}
+        filter.classbuffs[classname] = filter.classbuffs[classname] or {}
+        filter.classbuffs[classname][auratype] = filter.classbuffs[classname][auratype] or {}
+        filter.classbuffs[classname][auratype][auraname] = true
+    elseif filter.classbuffs and filter.classbuffs[classname] and filter.classbuffs[classname][auratype] then
+        filter.classbuffs[classname][auratype][auraname] = nil
+        local hasdata = false
+        for _ in pairs(filter.classbuffs[classname][auratype]) do
+            hasdata = true
+            break
+        end
+        if not hasdata then
+            filter.classbuffs[classname][auratype] = nil
+        end
+    end
+    bg:UpdateData()
+end
+
+-- builds the Class Watch tab for a given bar group id: a single checklist of every class
+-- name ever seen (your own alts, plus anyone you've grouped with -- never freely typed, so
+-- there's no way to misspell one), and one buff-name sub-checklist per class you've checked,
+-- mirroring the White List / Black List multiselect structure. A checked class's buffs are
+-- only consulted for Show Missing while a group member of that exact class is present in
+-- your party/raid.
+local function BuildClassWatchOptions(id)
+    local args = {
+        addclass = {
+            order = 0,
+            type = "input",
+            width = "full",
+            name = L["OPTIONS_GROUP_FILTER_CLASSWATCH_ADDCLASS_NAME"],
+            desc = L["OPTIONS_GROUP_FILTER_CLASSWATCH_ADDCLASS_DESC"],
+            get = false,
+            set = function(info, v)
+                v = string_trim(v or "")
+                if v ~= "" then
+                    ElkBuffBars:AddKnownClass(v)
+                end
+            end,
+        },
+        classestracked = {
+            order = 1,
+            type = "multiselect",
+            name = L["OPTIONS_GROUP_FILTER_CLASSWATCH_TRACKED_NAME"],
+            values = knownclasses_validate,
+            get = function(info, i)
+                local ct = ElkBuffBars.db.profile.bargroups[id].filter.classestracked
+                return ct and ct[knownclasses_validate[i]] or false
+            end,
+            set = function(info, i, value) SetClassTracked(id, knownclasses_validate[i], value) end,
+        },
+    }
+    -- one sub-group per known class, always present in the tree but hidden unless that
+    -- class is currently checked above -- built this way (instead of only for checked
+    -- classes) because this options table is only constructed once per bar group, so a
+    -- class checked later still needs its entry to already exist for "hidden" to reveal it
+    for i, classname in ipairs(knownclasses_validate) do
+        args["class_"..classname] = {
+            order = 1 + i,
+            type = "group",
+            name = classname,
+            desc = L["OPTIONS_GROUP_FILTER_CLASSWATCH_PERCLASS_DESC"],
+            hidden = function(info)
+                local ct = ElkBuffBars.db.profile.bargroups[id].filter.classestracked
+                return not (ct and ct[classname])
+            end,
+            args = {
+                    search = BuildSearchBoxOption("classwatch_"..id.."_"..classname),
+                    BUFF = BuildNameChecklist("BUFF", "classwatch_"..id.."_"..classname, classname,
+                        function(name)
+                            local cb = ElkBuffBars.db.profile.bargroups[id].filter.classbuffs
+                            return cb and cb[classname] and cb[classname].BUFF and cb[classname].BUFF[name] or false
+                        end,
+                        function(name, value) SetClassBuffFilter(id, classname, "BUFF", name, value) end,
+                        1, L["AURATYPE_BUFF"]),
+                    DEBUFF = BuildNameChecklist("DEBUFF", "classwatch_"..id.."_"..classname, classname,
+                        function(name)
+                            local cb = ElkBuffBars.db.profile.bargroups[id].filter.classbuffs
+                            return cb and cb[classname] and cb[classname].DEBUFF and cb[classname].DEBUFF[name] or false
+                        end,
+                        function(name, value) SetClassBuffFilter(id, classname, "DEBUFF", name, value) end,
+                        2, L["AURATYPE_DEBUFF"]),
+                    TENCH = BuildNameChecklist("TENCH", "classwatch_"..id.."_"..classname, classname,
+                        function(name)
+                            local cb = ElkBuffBars.db.profile.bargroups[id].filter.classbuffs
+                            return cb and cb[classname] and cb[classname].TENCH and cb[classname].TENCH[name] or false
+                        end,
+                        function(name, value) SetClassBuffFilter(id, classname, "TENCH", name, value) end,
+                        3, L["AURATYPE_TENCH"]),
+                    TRACKING = BuildNameChecklist("TRACKING", "classwatch_"..id.."_"..classname, classname,
+                        function(name)
+                            local cb = ElkBuffBars.db.profile.bargroups[id].filter.classbuffs
+                            return cb and cb[classname] and cb[classname].TRACKING and cb[classname].TRACKING[name] or false
+                        end,
+                        function(name, value) SetClassBuffFilter(id, classname, "TRACKING", name, value) end,
+                        4, L["AURATYPE_TRACKING"]),
+                },
+            }
+    end
+    return args
 end
 
 local values_text_template = {
@@ -2150,6 +3248,45 @@ function ElkBuffBars:GetGroupOptions(id)
                     local bg = ElkBuffBars.bargroups[id]
                     bg.layout.hideanchorwhenempty = not bg.layout.hideanchorwhenempty
                     bg:RefreshAnchorVisibility()
+                end,
+            },
+            hideincombat = {
+                order = 102.6,
+                type = "toggle",
+                width = "double",
+                name = L["OPTIONS_GROUP_HIDEINCOMBAT_NAME"],
+                desc = L["OPTIONS_GROUP_HIDEINCOMBAT_DESC"],
+                get = function(info) return ElkBuffBars.db.profile.bargroups[id].hideincombat end,
+                set = function(info)
+                    local bg = ElkBuffBars.bargroups[id]
+                    bg.layout.hideincombat = not bg.layout.hideincombat
+                    bg:RefreshContainerVisibility()
+                end,
+            },
+            hidewhennomissing = {
+                order = 102.7,
+                type = "toggle",
+                width = "double",
+                name = L["OPTIONS_GROUP_HIDEWHENNOMISSING_NAME"],
+                desc = L["OPTIONS_GROUP_HIDEWHENNOMISSING_DESC"],
+                get = function(info) return ElkBuffBars.db.profile.bargroups[id].hidewhennomissing end,
+                set = function(info)
+                    local bg = ElkBuffBars.bargroups[id]
+                    bg.layout.hidewhennomissing = not bg.layout.hidewhennomissing
+                    bg:RefreshContainerVisibility()
+                end,
+            },
+            hidewhenallmissing = {
+                order = 102.8,
+                type = "toggle",
+                width = "double",
+                name = L["OPTIONS_GROUP_HIDEWHENALLMISSING_NAME"],
+                desc = L["OPTIONS_GROUP_HIDEWHENALLMISSING_DESC"],
+                get = function(info) return ElkBuffBars.db.profile.bargroups[id].hidewhenallmissing end,
+                set = function(info)
+                    local bg = ElkBuffBars.bargroups[id]
+                    bg.layout.hidewhenallmissing = not bg.layout.hidewhenallmissing
+                    bg:RefreshContainerVisibility()
                 end,
             },
             anchortext = {
@@ -3044,46 +4181,35 @@ function ElkBuffBars:GetGroupOptions(id)
                         name = L["OPTIONS_GROUP_FILTER_NAME_WHITELIST_NAME"],
                         desc = L["OPTIONS_GROUP_FILTER_NAME_WHITELIST_DESC"],
                         args = {
-                            BUFF = {
-                                type = "multiselect",
-                                name = L["AURATYPE_BUFF"],
-                                values = knownnames_validate.BUFF,
-                                get = function(info, i)
+                            search = BuildSearchBoxOption("whitelist_"..id),
+                            BUFF = BuildNameChecklist("BUFF", "whitelist_"..id, nil,
+                                function(name)
                                     local ni = ElkBuffBars.db.profile.bargroups[id].filter.names_include
-                                    return ni and ni.BUFF and ni.BUFF[knownnames_validate.BUFF[i]] or false
+                                    return ni and ni.BUFF and ni.BUFF[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, true, "BUFF", knownnames_validate.BUFF[i], value) end,
-                            },
-                            DEBUFF = {
-                                type = "multiselect",
-                                name = L["AURATYPE_DEBUFF"],
-                                values = knownnames_validate.DEBUFF,
-                                get = function(info, i)
+                                function(name, value) SetNameFilter(id, true, "BUFF", name, value) end,
+                                1, L["AURATYPE_BUFF"]),
+                            DEBUFF = BuildNameChecklist("DEBUFF", "whitelist_"..id, nil,
+                                function(name)
                                     local ni = ElkBuffBars.db.profile.bargroups[id].filter.names_include
-                                    return ni and ni.DEBUFF and ni.DEBUFF[knownnames_validate.DEBUFF[i]] or false
+                                    return ni and ni.DEBUFF and ni.DEBUFF[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, true, "DEBUFF", knownnames_validate.DEBUFF[i], value) end,
-                            },
-                            TENCH = {
-                                type = "multiselect",
-                                name = L["AURATYPE_TENCH"],
-                                values = knownnames_validate.TENCH,
-                                get = function(info, i)
+                                function(name, value) SetNameFilter(id, true, "DEBUFF", name, value) end,
+                                2, L["AURATYPE_DEBUFF"]),
+                            TENCH = BuildNameChecklist("TENCH", "whitelist_"..id, nil,
+                                function(name)
                                     local ni = ElkBuffBars.db.profile.bargroups[id].filter.names_include
-                                    return ni and ni.TENCH and ni.TENCH[knownnames_validate.TENCH[i]] or false
+                                    return ni and ni.TENCH and ni.TENCH[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, true, "TENCH", knownnames_validate.TENCH[i], value) end,
-                            },
-                            TRACKING = {
-                                type = "multiselect",
-                                name = L["AURATYPE_TRACKING"],
-                                values = knownnames_validate.TRACKING,
-                                get = function(info, i)
+                                function(name, value) SetNameFilter(id, true, "TENCH", name, value) end,
+                                3, L["AURATYPE_TENCH"]),
+                            TRACKING = BuildNameChecklist("TRACKING", "whitelist_"..id, nil,
+                                function(name)
                                     local ni = ElkBuffBars.db.profile.bargroups[id].filter.names_include
-                                    return ni and ni.TRACKING and ni.TRACKING[knownnames_validate.TRACKING[i]] or false
+                                    return ni and ni.TRACKING and ni.TRACKING[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, true, "TRACKING", knownnames_validate.TRACKING[i], value) end,
-                            },
+                                function(name, value) SetNameFilter(id, true, "TRACKING", name, value) end,
+                                4, L["AURATYPE_TRACKING"]),
                         },
                     },
                     names_exclude = {
@@ -3092,47 +4218,133 @@ function ElkBuffBars:GetGroupOptions(id)
                         name = L["OPTIONS_GROUP_FILTER_NAME_BLACKLIST_NAME"],
                         desc = L["OPTIONS_GROUP_FILTER_NAME_BLACKLIST_DESC"],
                         args = {
-                            BUFF = {
-                                type = "multiselect",
-                                name = L["AURATYPE_BUFF"],
-                                values = knownnames_validate.BUFF,
-                                get = function(info, i)
+                            search = BuildSearchBoxOption("blacklist_"..id),
+                            BUFF = BuildNameChecklist("BUFF", "blacklist_"..id, nil,
+                                function(name)
                                     local ne = ElkBuffBars.db.profile.bargroups[id].filter.names_exclude
-                                    return ne and ne.BUFF and ne.BUFF[knownnames_validate.BUFF[i]] or false
+                                    return ne and ne.BUFF and ne.BUFF[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, false, "BUFF", knownnames_validate.BUFF[i], value) end,
-                            },
-                            DEBUFF = {
-                                type = "multiselect",
-                                name = L["AURATYPE_DEBUFF"],
-                                values = knownnames_validate.DEBUFF,
-                                get = function(info, i)
+                                function(name, value) SetNameFilter(id, false, "BUFF", name, value) end,
+                                1, L["AURATYPE_BUFF"]),
+                            DEBUFF = BuildNameChecklist("DEBUFF", "blacklist_"..id, nil,
+                                function(name)
                                     local ne = ElkBuffBars.db.profile.bargroups[id].filter.names_exclude
-                                    return ne and ne.DEBUFF and ne.DEBUFF[knownnames_validate.DEBUFF[i]] or false
+                                    return ne and ne.DEBUFF and ne.DEBUFF[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, false, "DEBUFF", knownnames_validate.DEBUFF[i], value) end,
-                            },
-                            TENCH = {
-                                type = "multiselect",
-                                name = L["AURATYPE_TENCH"],
-                                values = knownnames_validate.TENCH,
-                                get = function(info, i)
+                                function(name, value) SetNameFilter(id, false, "DEBUFF", name, value) end,
+                                2, L["AURATYPE_DEBUFF"]),
+                            TENCH = BuildNameChecklist("TENCH", "blacklist_"..id, nil,
+                                function(name)
                                     local ne = ElkBuffBars.db.profile.bargroups[id].filter.names_exclude
-                                    return ne and ne.TENCH and ne.TENCH[knownnames_validate.TENCH[i]] or false
+                                    return ne and ne.TENCH and ne.TENCH[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, false, "TENCH", knownnames_validate.TENCH[i], value) end,
-                            },
-                            TRACKING = {
-                                type = "multiselect",
-                                name = L["AURATYPE_TRACKING"],
-                                values = knownnames_validate.TRACKING,
-                                get = function(info, i)
+                                function(name, value) SetNameFilter(id, false, "TENCH", name, value) end,
+                                3, L["AURATYPE_TENCH"]),
+                            TRACKING = BuildNameChecklist("TRACKING", "blacklist_"..id, nil,
+                                function(name)
                                     local ne = ElkBuffBars.db.profile.bargroups[id].filter.names_exclude
-                                    return ne and ne.TRACKING and ne.TRACKING[knownnames_validate.TRACKING[i]] or false
+                                    return ne and ne.TRACKING and ne.TRACKING[name] or false
                                 end,
-                                set = function(info, i, value) SetNameFilter(id, false, "TRACKING", knownnames_validate.TRACKING[i], value) end,
-                            },
+                                function(name, value) SetNameFilter(id, false, "TRACKING", name, value) end,
+                                4, L["AURATYPE_TRACKING"]),
                         },
+                    },
+                    showmissing = {
+                        order = 108,
+                        type = "toggle",
+                        width = "full",
+                        name = L["OPTIONS_GROUP_FILTER_SHOWMISSING_NAME"],
+                        desc = L["OPTIONS_GROUP_FILTER_SHOWMISSING_DESC"],
+                        get = function(info) return ElkBuffBars.db.profile.bargroups[id].filter.showmissing end,
+                        set = function(info, v)
+                            ElkBuffBars.bargroups[id].layout.filter.showmissing = v
+                            ElkBuffBars:DoFullUpdate()
+                        end,
+                    },
+                    whitelistisfilter = {
+                        order = 108.1,
+                        type = "toggle",
+                        width = "full",
+                        name = L["OPTIONS_GROUP_FILTER_WHITELISTISFILTER_NAME"],
+                        desc = L["OPTIONS_GROUP_FILTER_WHITELISTISFILTER_DESC"],
+                        get = function(info) return ElkBuffBars.db.profile.bargroups[id].filter.whitelistisfilter end,
+                        set = function(info, v)
+                            ElkBuffBars.bargroups[id].layout.filter.whitelistisfilter = v
+                            ElkBuffBars:DoFullUpdate()
+                        end,
+                    },
+                    selfbuffs = {
+                        order = 108.15,
+                        type = "group",
+                        name = L["OPTIONS_GROUP_FILTER_SELFBUFFS_NAME"],
+                        desc = L["OPTIONS_GROUP_FILTER_SELFBUFFS_DESC"],
+                        args = (function()
+                            -- filter.selfbuffs is keyed by class first (see SetSelfBuffFilter
+                            -- above), so switching alts on a shared profile only ever shows and
+                            -- tracks THIS class's own self-buff selections.
+                            local myClass = (UnitClass("player"))
+                            return {
+                            search = BuildSearchBoxOption("selfbuffs_"..id),
+                            BUFF = BuildNameChecklist("BUFF", "selfbuffs_"..id, myClass,
+                                function(name)
+                                    local sb = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffs
+                                    sb = sb and sb[myClass]
+                                    return sb and sb.BUFF and sb.BUFF[name] or false
+                                end,
+                                function(name, value) SetSelfBuffFilter(id, "BUFF", name, value) end,
+                                1, L["AURATYPE_BUFF"]),
+                            DEBUFF = BuildNameChecklist("DEBUFF", "selfbuffs_"..id, myClass,
+                                function(name)
+                                    local sb = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffs
+                                    sb = sb and sb[myClass]
+                                    return sb and sb.DEBUFF and sb.DEBUFF[name] or false
+                                end,
+                                function(name, value) SetSelfBuffFilter(id, "DEBUFF", name, value) end,
+                                2, L["AURATYPE_DEBUFF"]),
+                            TENCH = BuildNameChecklist("TENCH", "selfbuffs_"..id, myClass,
+                                function(name)
+                                    local sb = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffs
+                                    sb = sb and sb[myClass]
+                                    return sb and sb.TENCH and sb.TENCH[name] or false
+                                end,
+                                function(name, value) SetSelfBuffFilter(id, "TENCH", name, value) end,
+                                3, L["AURATYPE_TENCH"]),
+                            TRACKING = BuildNameChecklist("TRACKING", "selfbuffs_"..id, myClass,
+                                function(name)
+                                    local sb = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffs
+                                    sb = sb and sb[myClass]
+                                    return sb and sb.TRACKING and sb.TRACKING[name] or false
+                                end,
+                                function(name, value) SetSelfBuffFilter(id, "TRACKING", name, value) end,
+                                4, L["AURATYPE_TRACKING"]),
+                            altgroups = {
+                                order = 5,
+                                type = "group",
+                                name = L["OPTIONS_GROUP_FILTER_SELFALTGROUPS_NAME"],
+                                desc = L["OPTIONS_GROUP_FILTER_SELFALTGROUPS_DESC"],
+                                args = BuildSelfBuffAltGroupsOptions(id),
+                            },
+                            }
+                        end)(),
+                    },
+                    classwatch = {
+                        order = 108.2,
+                        type = "group",
+                        name = L["OPTIONS_GROUP_FILTER_CLASSWATCH_NAME"],
+                        desc = L["OPTIONS_GROUP_FILTER_CLASSWATCH_DESC"],
+                        args = BuildClassWatchOptions(id),
+                    },
+                    alertblacklisted = {
+                        order = 108.3,
+                        type = "toggle",
+                        width = "full",
+                        name = L["OPTIONS_GROUP_FILTER_ALERTBLACKLISTED_NAME"],
+                        desc = L["OPTIONS_GROUP_FILTER_ALERTBLACKLISTED_DESC"],
+                        get = function(info) return ElkBuffBars.db.profile.bargroups[id].filter.alertblacklisted end,
+                        set = function(info, v)
+                            ElkBuffBars.bargroups[id].layout.filter.alertblacklisted = v
+                            ElkBuffBars:DoFullUpdate()
+                        end,
                     },
                 },
             },
