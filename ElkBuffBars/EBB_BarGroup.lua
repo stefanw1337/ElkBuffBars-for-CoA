@@ -129,11 +129,39 @@ function prototype:UpdateAnnounceButton()
 	end
 end
 
+-- walks up the stickto chain from this group's direct target, skipping any group that's
+-- currently hidden (in combat, no missing bars, etc.) so a group stuck to a hidden group
+-- re-anchors to the nearest VISIBLE ancestor instead -- it slides up and takes the hidden
+-- group's spot rather than leaving a gap where that group used to be. Falls back to the far
+-- end of the chain (even if that's hidden too) if nothing in it is currently visible, so
+-- there's always something valid to anchor to. Returns nil if this group isn't stuck to
+-- anything, or if the chain is broken (a referenced group no longer exists).
+function prototype:GetStickTarget()
+	local layout = self.layout
+	if not layout.stickto then return nil end
+	local candidate = ElkBuffBars.bargroups[layout.stickto]
+	for _ = 1, 32 do -- defensive cap; StickGroup_CheckLoop already prevents real cycles when sticking
+		if not candidate then return nil end
+		if candidate:GetContainer():IsShown() or not candidate.layout.stickto then
+			return candidate
+		end
+		candidate = ElkBuffBars.bargroups[candidate.layout.stickto]
+	end
+	return candidate
+end
+
 function prototype:SetPosition()
 	local layout = self.layout
 	self.frames.container:ClearAllPoints()
 	if layout.stickto then
-		local target = ElkBuffBars.bargroups[layout.stickto]:GetContainer()
+		local targetgroup = self:GetStickTarget()
+		local target = targetgroup and targetgroup:GetContainer()
+		if not target then
+			-- broken reference (the stuck-to group no longer exists) -- fall back to a fixed
+			-- spot instead of leaving the frame with no anchor point at all
+			self.frames.container:SetPoint(layout.growup and "BOTTOMLEFT" or "TOPLEFT", UIParent, "BOTTOMLEFT", layout.x or 0, layout.y or 0)
+			return
+		end
 		if layout.stickmode == "horizontal" then
 			-- attach beside the target group (my LEFT edge to their RIGHT edge, or vice versa),
 			-- aligned top/middle/bottom via stickvalign, so growth of either group pushes the other sideways.
@@ -162,13 +190,10 @@ function prototype:ToggleConfigMode(enabled)
 	if enabled == nil then
 		enabled = not self.layout.configmode
 	end
-	if enabled then
-		self.layout.configmode = true
-		self:UpdateAnchor()
-	else
-		self.layout.configmode = false
-		self:UpdateAnchor()
-	end
+	self.layout.configmode = enabled
+	self:UpdateAnchor()
+	self:RefreshContainerVisibility()
+	self:RefreshAnchorVisibility()
 end
 
 function prototype:UpdateAnchor()
@@ -246,14 +271,18 @@ function prototype:GetRealDataCount()
 	return total, missing
 end
 
--- shows/hides the anchor (honoring Hide Anchor When Empty) and refreshes its "(count)" text.
--- Deliberately does NOT call UpdateData/UpdateBars, so this is safe to call from UpdateBars()
--- itself every time the buff count changes, without recursing.
+-- shows/hides the anchor and refreshes its "(count)" text. "Show Anchor" (anchorshown) is an
+-- unconditional override: once it's on, the anchor always shows, full stop -- "Hide Anchor
+-- When Empty" only gets consulted for the OTHER path in, config mode. This deliberately never
+-- writes to hideanchorwhenempty itself, so turning Show Anchor back off later restores exactly
+-- whatever Hide Anchor When Empty was already set to do, untouched the whole time it was
+-- overridden. Deliberately does NOT call UpdateData/UpdateBars, so this is safe to call from
+-- UpdateBars() itself every time the buff count changes, without recursing.
 function prototype:RefreshAnchorVisibility()
 	local frames = self.frames
 	if not frames.anchor then return end
 	local total, missing = self:GetRealDataCount()
-	local show = (self.layout.anchorshown or self.layout.configmode) and not (self.layout.hideanchorwhenempty and total == 0)
+	local show = self.layout.anchorshown or (self.layout.configmode and not (self.layout.hideanchorwhenempty and total == 0))
 	if show then
 		frames.anchor:Show()
 		if frames.anchortext then
@@ -267,37 +296,97 @@ function prototype:RefreshAnchorVisibility()
 	end
 end
 
--- hides/shows the WHOLE group (not just the anchor) per three independent opt-in toggles:
+-- true if at least one bar in this group has a real, running countdown (not a Show Missing
+-- placeholder, not an untilcancelled/permanent buff) inside `seconds` of running out. Used by
+-- "Hide Unless Something's About To Expire" below -- this is the one visibility check that
+-- can't be driven purely by aura/combat events, since crossing under the threshold happens
+-- from the clock ticking with nothing else about the aura changing; see
+-- ElkBuffBars:RefreshSoonToExpireGroups for the periodic timer that re-checks this.
+function prototype:HasBarExpiringSoon(seconds)
+	for _, bar in ipairs(self.bars) do
+		local data = bar.data
+		if data and not data.missing and not data.untilcancelled and data.type ~= "FAKE"
+		  and bar.timeleft > 0 and bar.timeleft <= seconds then
+			return true
+		end
+	end
+	return false
+end
+
+-- Hides the group container and makes sure GameTooltip doesn't get left stuck on-screen if it
+-- was anchored to something inside this group (a bar, the anchor, or the announce button) that's
+-- about to disappear along with it. Hide() doesn't reliably fire OnLeave on whatever frame the
+-- mouse was over when its ancestor vanishes out from under it, so the tooltip that frame opened
+-- just stays put forever unless we explicitly close it here. IsVisible() (unlike IsShown()) walks
+-- the whole ancestor chain, so this catches the owner regardless of which child frame it is.
+function prototype:HideContainer()
+	self.frames.container:Hide()
+	local owner = GameTooltip:GetOwner()
+	if owner and not owner:IsVisible() then
+		GameTooltip:Hide()
+	end
+end
+
+-- hides/shows the WHOLE group (not just the anchor) per four independent opt-in toggles:
 -- "Hide Group In Combat" (declutter mid-fight), "Hide Group When No Missing Bars" (only pop up
--- once Show Missing actually has something red to flag), and "Hide Group When All Bars Missing"
+-- once Show Missing actually has something red to flag), "Hide Group When All Bars Missing"
 -- (hide if EVERY tracked name is absent -- e.g. a 10-slot Ascension world buff tracker with
--- none of them up isn't useful as a wall of red, so hide the whole thing rather than show it).
+-- none of them up isn't useful as a wall of red, so hide the whole thing rather than show it),
+-- and "Hide Unless Something's About To Expire" (stay hidden until a bar is either inside its
+-- expiry warning window -- an early heads-up before something falls off -- or has already
+-- fallen off entirely. Both count, not just the warning window: hiding again the instant a
+-- blinking bar actually hits 0 and turns into a red Show Missing bar would yank the group away
+-- right when you need it most. See HasBarExpiringSoon above; the bars themselves handle
+-- blinking while this is active, in EBB_Bar.lua's OnUpdate -- only the not-yet-expired ones
+-- blink, since an already-missing bar's solid red color is its own signal).
+-- Config mode overrides all of the above and always shows the container -- otherwise a group
+-- that currently satisfies one of its own Hide conditions (e.g. you're in combat and it has
+-- Hide In Combat on) would stay invisible even while actively editing it with Show Anchor on,
+-- since the anchor is a CHILD of this container and can't show if its parent is hidden.
 -- Any single reason is enough to hide; all applicable ones must say "show" for the group to
 -- show -- so hidewhennomissing + hidewhenallmissing together means "only show when there's a
--- genuine mix of some active and some missing." Safe to call anytime -- doesn't touch data or
--- recurse into UpdateData.
+-- genuine mix of some active and some missing." Also triggers ElkBuffBars:RefreshStuckPositions
+-- whenever this group's shown/hidden state actually flips, so any group stuck to this one
+-- (directly, or transitively through GetStickTarget in SetPosition) re-anchors to whatever's
+-- now the nearest visible ancestor instead of sitting in a gap. Safe to call anytime -- doesn't
+-- touch data or recurse into UpdateData.
 function prototype:RefreshContainerVisibility()
 	local layout = self.layout
 	if not layout then return end
 
-	if layout.hideincombat and InCombatLockdown() then
-		self.frames.container:Hide()
-		return
+	local shouldshow = true
+
+	if not layout.configmode then
+		if layout.hideincombat and InCombatLockdown() then
+			shouldshow = false
+		end
+
+		if shouldshow and (layout.hidewhennomissing or layout.hidewhenallmissing) then
+			local total, missing = self:GetRealDataCount()
+			if layout.hidewhennomissing and missing == 0 then
+				shouldshow = false
+			elseif layout.hidewhenallmissing and total > 0 and missing == total then
+				shouldshow = false
+			end
+		end
+
+		if shouldshow and layout.hideunlesssoon then
+			local _, missing = self:GetRealDataCount()
+			if missing == 0 and not self:HasBarExpiringSoon(layout.hideunlesssoonseconds or 20) then
+				shouldshow = false
+			end
+		end
 	end
 
-	if layout.hidewhennomissing or layout.hidewhenallmissing then
-		local total, missing = self:GetRealDataCount()
-		if layout.hidewhennomissing and missing == 0 then
-			self.frames.container:Hide()
-			return
-		end
-		if layout.hidewhenallmissing and total > 0 and missing == total then
-			self.frames.container:Hide()
-			return
-		end
+	local wasshown = self.frames.container:IsShown()
+	if shouldshow then
+		self.frames.container:Show()
+	else
+		self:HideContainer()
 	end
-
-	self.frames.container:Show()
+	if shouldshow ~= wasshown then
+		ElkBuffBars:RefreshStuckPositions()
+	end
 end
 
 function prototype:StartMoving()
@@ -307,7 +396,20 @@ end
 function prototype:StopMoving()
 	self.frames.container:StopMovingOrSizing()
 	self.frames.container:SetUserPlaced(false) -- don't save in frame cache
-	if not ElkBuffBars:StickGroup(self) then
+
+	-- holding Shift while you drop it skips magnetize entirely, even if you happen to let go
+	-- inside another group's snap zone -- lets you freely reposition something without fighting
+	-- the pull back into place on every small/slow drag. Also detaches it from whatever it was
+	-- stuck to before, since holding Shift is a clear "put this on its own" signal, not just
+	-- "don't re-stick this one time" -- StickGroup below would normally do that detaching
+	-- itself (it always clears stickto before searching), but it never runs at all when Shift
+	-- is held, so it's done here instead.
+	local skipstick = IsShiftKeyDown and IsShiftKeyDown()
+
+	if skipstick or not ElkBuffBars:StickGroup(self) then
+		self.layout.stickto = nil
+		self.layout.stickmode = nil
+		self.layout.stickvalign = nil
 		self.layout.x = self.frames.container:GetLeft()
 		self.layout.y = self.layout.growup and self.frames.container:GetBottom() or self.frames.container:GetTop()
 		self.frames.container:ClearAllPoints()
@@ -487,11 +589,15 @@ end
 -- buffs (though a name in the set can still be given to you by someone else -- the check only
 -- cares whether the name is active, not who cast it, which is what makes a count > 1 useful
 -- for "my own plus a different one from a groupmate"). Spec-restricted sets are skipped
--- entirely while you're in a different talent spec, and "Only Needed While Grouped" sets are
--- skipped entirely while solo (not gated to any specific class -- just grouped or not). The
--- "shared" flag doesn't skip the set -- it's read by UpdateData below, which additionally
--- checks party/raid members of your own class for each not-yet-active name before deciding
--- it's genuinely missing.
+-- entirely while a different talent tree is your primary, and "Only Needed While Grouped" sets
+-- are skipped entirely while solo (not gated to any specific class -- just grouped or not).
+-- "Only In Spec" is checked against GetPrimaryTalentTree() (which of your talent trees has the
+-- most points spent -- 1/2/3), NOT GetActiveTalentGroup() (which of your two SAVED dual-spec
+-- loadouts is currently active) -- those are unrelated axes, and only the former actually
+-- matches what "Spec 1/2/3" means in the options UI, including supporting a 3rd tree at all
+-- (dual-spec loadouts only ever go up to 2). The "shared" flag doesn't skip the set -- it's
+-- read by UpdateData below, which additionally checks party/raid members of your own class for
+-- each not-yet-active name before deciding it's genuinely missing.
 local function GetSelfBuffAltGroups(filter)
 	local groups = {}
 	if not filter.selfbuffaltgroups then return groups end
@@ -501,7 +607,7 @@ local function GetSelfBuffAltGroups(filter)
 	local myClass = (UnitClass("player"))
 	local byclass = filter.selfbuffaltgroups[myClass]
 	if not byclass then return groups end
-	local activespec = GetActiveTalentGroup and GetActiveTalentGroup() or nil
+	local activespec = GetPrimaryTalentTree and GetPrimaryTalentTree() or nil
 	local grouped = IsInGroup() or IsInRaid()
 	for _, byname in pairs(byclass) do
 		if (not byname.spec or byname.spec == activespec) and (not byname.onlygrouped or grouped) then
@@ -632,6 +738,91 @@ local function FindMissingIcon(auratype, names)
 	return "Interface\\Icons\\INV_Misc_QuestionMark"
 end
 
+-- auratypes that can actually appear under an Alt Set slot, alongside that slot's other fields
+-- (count/spec/onlygrouped/shared -- see SetSelfBuffAltGroupCount etc. above) -- needed to tell
+-- "this key is an aura bucket to walk into" from "this key is a setting" when iterating a slot.
+local ALT_GROUP_AURATYPES = { BUFF = true, DEBUFF = true, TENCH = true, TRACKING = true }
+
+-- classbuffs[auratype][auraname] (this bar group's Group Watcher checklist) treats every
+-- checked name as its own independent requirement. But names grouped together under one of
+-- this class's Alt Sets (filter.selfbuffaltgroups -- the "Self Buff Alternatives" checkboxes)
+-- are ALTERNATIVES for the same slot, not separate needs: having any ONE of them up satisfies
+-- it, that's the whole point of grouping them there. Checking each independently is exactly
+-- what made announcing flag a class -- including your own, since checking a name under your
+-- own Alt Sets auto-links it into this same classbuffs list -- as "missing" one alternative
+-- while it's wearing a perfectly valid different one. Returns the same flat list
+-- AnnounceMissingGroupBuffs expects, but with each Alt Set's alternatives collapsed into one
+-- "NameA/NameB" entry that only counts as missing if NONE of them are active.
+local function GetMissingNames(filter, member)
+	local classbuffs = filter.classbuffs and filter.classbuffs[member.class]
+	if not classbuffs then return nil end
+
+	local altgroups = filter.selfbuffaltgroups and filter.selfbuffaltgroups[member.class]
+
+	-- every name that belongs to some Alt Set slot, so the plain per-name pass below can skip
+	-- them and leave them to the group-aware pass instead
+	local grouped
+	if altgroups then
+		grouped = {}
+		for _, slot in pairs(altgroups) do
+			for auratype, names in pairs(slot) do
+				if ALT_GROUP_AURATYPES[auratype] then
+					grouped[auratype] = grouped[auratype] or {}
+					for name in pairs(names) do
+						grouped[auratype][name] = true
+					end
+				end
+			end
+		end
+	end
+
+	local missingNames = {}
+
+	-- ungrouped names: each is its own independent requirement, same as before
+	for auratype, names in pairs(classbuffs) do
+		for name in pairs(names) do
+			if not (grouped and grouped[auratype] and grouped[auratype][name]) then
+				if not UnitHasAuraName(member.unit, auratype, name) then
+					table_insert(missingNames, name)
+				end
+			end
+		end
+	end
+
+	-- grouped names: only missing if NONE of that Alt Set's alternatives (that are still
+	-- actually checked under Class Watch -- unchecking one there directly shouldn't keep
+	-- requiring it) are active
+	if altgroups then
+		for _, slot in pairs(altgroups) do
+			for auratype, names in pairs(slot) do
+				if ALT_GROUP_AURATYPES[auratype] then
+					local relevant = {}
+					for name in pairs(names) do
+						if classbuffs[auratype] and classbuffs[auratype][name] then
+							table_insert(relevant, name)
+						end
+					end
+					if #relevant > 0 then
+						local satisfied = false
+						for _, name in ipairs(relevant) do
+							if UnitHasAuraName(member.unit, auratype, name) then
+								satisfied = true
+								break
+							end
+						end
+						if not satisfied then
+							table_sort(relevant)
+							table_insert(missingNames, table_concat(relevant, "/"))
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return missingNames
+end
+
 -- checks EVERY raid/party member (including yourself) against their OWN class's Group Watcher
 -- checklist (this bar group's filter.classbuffs), and reports anyone missing one of their own
 -- class's checked buffs to raid/party chat, one line per person, e.g. "Missing in group 3 from
@@ -653,23 +844,13 @@ function prototype:AnnounceMissingGroupBuffs()
 
 	local lines = {}
 	for _, member in ipairs(GetGroupRoster()) do
-		local classbuffs = filter.classbuffs[member.class]
-		if classbuffs then
-			local missingNames = {}
-			for auratype, names in pairs(classbuffs) do
-				for name in pairs(names) do
-					if not UnitHasAuraName(member.unit, auratype, name) then
-						table_insert(missingNames, name)
-					end
-				end
-			end
-			if #missingNames > 0 then
-				table_sort(missingNames)
-				local prefix = member.subgroup
-					and string_format(L["ANNOUNCE_LINE_RAID"], member.subgroup, member.class, member.name)
-					or string_format(L["ANNOUNCE_LINE_PARTY"], member.class, member.name)
-				table_insert(lines, prefix..table_concat(missingNames, ", "))
-			end
+		local missingNames = GetMissingNames(filter, member)
+		if missingNames and #missingNames > 0 then
+			table_sort(missingNames)
+			local prefix = member.subgroup
+				and string_format(L["ANNOUNCE_LINE_RAID"], member.subgroup, member.class, member.name)
+				or string_format(L["ANNOUNCE_LINE_PARTY"], member.class, member.name)
+			table_insert(lines, prefix..table_concat(missingNames, ", "))
 		end
 	end
 
@@ -680,14 +861,19 @@ function prototype:AnnounceMissingGroupBuffs()
 
 	-- batch multiple people's lines into messages under ~200 characters (chat has a hard cap
 	-- around 255), and stagger sending them a fraction of a second apart so a big raid with
-	-- lots of missing buffs doesn't trip the client's outgoing chat throttle.
+	-- lots of missing buffs doesn't trip the client's outgoing chat throttle. The separator
+	-- between joined lines must NOT contain "|" -- that's WoW's own chat escape character
+	-- (used for color codes, links, etc.), and a lone "|" not followed by a recognized escape
+	-- makes SendChatMessage reject the entire message with "Invalid escape code in chat
+	-- message" instead of just dropping the bad part, silently losing every batch that had to
+	-- join 2+ lines together.
 	local channel = inRaid and "RAID" or "PARTY"
 	local batches, current = {}, ""
 	for _, line in ipairs(lines) do
 		if current == "" then
 			current = line
-		elseif #current + 3 + #line <= 200 then
-			current = current.." | "..line
+		elseif #current + 4 + #line <= 200 then
+			current = current.." // "..line
 		else
 			table_insert(batches, current)
 			current = line
@@ -772,10 +958,17 @@ function prototype:UpdateData(updated)
 	end
 
 	-- anything that just vanished from the scan gets a brief grace period showing its last
-	-- known state, instead of its bar instantly disappearing (and likely reappearing next scan)
+	-- known state, instead of its bar instantly disappearing (and likely reappearing next
+	-- scan) -- but only while the unit itself still exists. If the unit is gone entirely
+	-- (you untargeted, cleared focus, etc.), grace-holding makes no sense: nothing will ever
+	-- trigger another scan to let the grace period actually expire, since nothing further
+	-- happens involving a unit that doesn't exist -- so the bar was orphaned, just sitting
+	-- there counting down on its own cached expiration time from whatever duration was left
+	-- on the original buff when you untargeted, instead of clearing right away like it should.
+	local targetgone = not UnitExists(layout.target)
 	for key, held in pairs(gracecache) do
 		if not seen[key] then
-			if now - held.lastseen > GRACE_PERIOD then
+			if targetgone or now - held.lastseen > GRACE_PERIOD then
 				gracecache[key] = nil
 			else
 				table_insert(data, held.data)
@@ -970,6 +1163,45 @@ function prototype:UpdateTimeleft()
 	end
 end
 
+-- true if this (auratype, realname) is tracked by ANY of the four ways a group can be told to
+-- care about a name: the plain White List, My Self Buffs, Self Buff Alternatives (Alt Sets),
+-- or Class Watch (checked for every class, not just your own -- the whole point of Class Watch
+-- is tracking OTHER classes' buffs). Used by CheckFilter below so "White List Is Filter" (on by
+-- default) doesn't hide a Self Buff/Alt Set/Class Watch entry just because it was never ALSO
+-- separately added to the White List -- checking a name in any of those other three places is
+-- just as much an inclusion signal as whitelisting it directly, and without this, an active
+-- buff that satisfies one of them still gets excluded from `data` entirely by the whitelist
+-- gate, so it can never register as "present" and always shows as missing regardless of
+-- anything else being configured correctly.
+local function IsNameTracked(filter, auratype, realname)
+	if filter.names_include and filter.names_include[auratype] and filter.names_include[auratype][realname] then
+		return true
+	end
+	local myClass = (UnitClass("player"))
+	local selfbuffs = filter.selfbuffs and filter.selfbuffs[myClass] and filter.selfbuffs[myClass][auratype]
+	if selfbuffs and selfbuffs[realname] then
+		return true
+	end
+	local altgroups = filter.selfbuffaltgroups and filter.selfbuffaltgroups[myClass]
+	if altgroups then
+		for _, slot in pairs(altgroups) do
+			local names = slot[auratype]
+			if names and names[realname] then
+				return true
+			end
+		end
+	end
+	if filter.classbuffs then
+		for _, byauratype in pairs(filter.classbuffs) do
+			local names = byauratype[auratype]
+			if names and names[realname] then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 -- checks for various filter settings
 function prototype:CheckFilter(data)
 	if not self.layout then
@@ -983,7 +1215,7 @@ function prototype:CheckFilter(data)
 		or (not data.untilcancelled and filter.timemax_min and data.timemax < filter.timemax_min)									-- min timemax
 		or (not data.untilcancelled and filter.timemax_max and data.timemax > filter.timemax_max)									-- max timemax
 		or (filter.untilcancelled and ((filter.untilcancelled == "only" and not data.untilcancelled) or (filter.untilcancelled == "hide" and data.untilcancelled)))
-		or (filter.names_include and filter.whitelistisfilter and not (filter.names_include[data.type] and filter.names_include[data.type][data.realname]))		-- show by name (unless White List is set to only feed Show Missing, not restrict display)
+		or (filter.names_include and filter.whitelistisfilter and not IsNameTracked(filter, data.type, data.realname))				-- show by name (unless White List is set to only feed Show Missing, not restrict display) -- also lets a name through if My Self Buffs, Self Buff Alternatives, or Class Watch has it, not just the White List itself
 		or (filter.names_exclude and filter.names_exclude[data.type] and filter.names_exclude[data.type][data.realname])			-- hide by name
 		or (filter.charges_min and data.charges < filter.charges_min)																-- min charges
 		or (filter.charges_max and data.charges > filter.charges_max)																-- max charges

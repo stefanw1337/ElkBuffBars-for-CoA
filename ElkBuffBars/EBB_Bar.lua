@@ -10,6 +10,8 @@ local unpack				= unpack
 
 local math_max				= math.max
 local math_min				= math.min
+local math_sin				= math.sin
+local math_abs				= math.abs
 
 local string_format			= string.format
 local string_match			= string.match
@@ -27,6 +29,10 @@ end
 function prototype:Reset()
     local container = self.frames.container
     container:SetScript("OnUpdate", nil)
+    container:SetAlpha(1)
+    if GameTooltip:GetOwner() == container then
+        GameTooltip:Hide()
+    end
     container:Hide()
     container:ClearAllPoints()
     if not InCombatLockdown() then
@@ -184,7 +190,23 @@ function prototype:OnUpdate(elapsed)
         self.timeleft = self.timeleft / data.timeMod
     end
     self:UpdateTimeleft()
+
+    -- "Hide Unless Something's About To Expire": once this bar is inside its group's expiry
+    -- warning window, pulse its alpha so it's obvious at a glance which one is the reason the
+    -- group just appeared. math_abs(sin(...)) gives a smooth 0->1->0 "breathing" pulse instead
+    -- of an abrupt on/off blink. Resets to fully opaque the moment it's outside the window
+    -- again (buff refreshed) -- see also Reset() and UpdateData() below for the other two
+    -- spots OnUpdate stops running, which reset alpha the same way so a recycled/refreshed bar
+    -- never gets stuck mid-pulse.
+    if self.parent.layout.hideunlesssoon and self.timeleft > 0
+      and self.timeleft <= (self.parent.layout.hideunlesssoonseconds or 20) then
+        frames.container:SetAlpha(0.45 + 0.55 * math_abs(math_sin(GetTime() * 5)))
+    else
+        frames.container:SetAlpha(1)
+    end
+
     if self.timeleft == 0 then
+        frames.container:SetAlpha(1)
         frames.container:SetScript("OnUpdate", nil)
     end
 
@@ -275,15 +297,46 @@ function prototype:UpdateLayout(layout)
 -- iconcount
     if layout.icon and layout.iconcount then
         if not frames.iconcount then
+            -- backdrop is a separate plain texture at the ARTWORK layer -- strictly above
+            -- BACKGROUND (where the icon itself lives) and below OVERLAY (where the fontstring
+            -- draws) in WoW's fixed layer order, so it's guaranteed to sit on top of the icon
+            -- and behind the text, with no frame-level ambiguity (same physical frame,
+            -- draw-layer order is absolute). 2-point anchoring it directly to frames.iconcount
+            -- (below) means it automatically tracks that fontstring's actual rendered size as
+            -- the digit count changes (1 vs 12 vs 123 stacks) with no manual width/height
+            -- recalculation required. Uses SetColorTexture where available (a flat, fully
+            -- opaque fill with no external file dependency) and falls back to the classic
+            -- WHITE8x8 utility texture (also flat/opaque, just an actual file) on older
+            -- clients without that API -- deliberately NOT reusing the tooltip background
+            -- texture some other backdrops in this addon use, since that one has a soft
+            -- transparency gradient baked into the image itself that all but disappears at
+            -- the tiny size a stack count needs.
+            frames.iconcountbg = frames.container:CreateTexture(nil, "ARTWORK")
+            if frames.iconcountbg.SetColorTexture then
+                frames.iconcountbg:SetColorTexture(1, 1, 1, 1)
+            else
+                frames.iconcountbg:SetTexture("Interface\\Buttons\\WHITE8x8")
+            end
             frames.iconcount = frames.container:CreateFontString(nil, "OVERLAY")
         end
         frames.iconcount:ClearAllPoints()
         frames.iconcount:SetPoint(layout.iconcountanchor, frames.icon, layout.iconcountanchor, (string_match(layout.iconcountanchor, "LEFT") and 3) or (string_match(layout.iconcountanchor, "RIGHT") and -3) or 0, (string_match(layout.iconcountanchor, "TOP") and -3) or (string_match(layout.iconcountanchor, "BOTTOM") and 3) or 0)
-        frames.iconcount:SetFont(LSM3:Fetch("font", layout.iconcountfont), layout.iconcountfontsize, "OUTLINE")
+        frames.iconcount:SetFont(LSM3:Fetch("font", layout.iconcountfont), layout.iconcountfontsize, layout.iconcountstyle)
         frames.iconcount:SetTextColor(layout.iconcountcolor[1], layout.iconcountcolor[2], layout.iconcountcolor[3], 1)
         frames.iconcount:Show()
+        if layout.iconcountbackdrop then
+            local c = layout.iconcountbackdropcolor
+            frames.iconcountbg:ClearAllPoints()
+            frames.iconcountbg:SetPoint("TOPLEFT", frames.iconcount, "TOPLEFT", -2, 2)
+            frames.iconcountbg:SetPoint("BOTTOMRIGHT", frames.iconcount, "BOTTOMRIGHT", 2, -2)
+            frames.iconcountbg:SetVertexColor(c[1], c[2], c[3], c[4])
+            frames.iconcountbg:Show()
+        else
+            frames.iconcountbg:Hide()
+        end
     else
         if frames.iconcount then frames.iconcount:Hide() end
+        if frames.iconcountbg then frames.iconcountbg:Hide() end
     end
 
 -- iconborder
@@ -577,6 +630,7 @@ function prototype:UpdateData(data)
         self.updateThrottle = 0
         frames.container:SetScript("OnUpdate", updateFunc)
     else
+        frames.container:SetAlpha(1)
         frames.container:SetScript("OnUpdate", nil)
     end
     self:UpdateText()

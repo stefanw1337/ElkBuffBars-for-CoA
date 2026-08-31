@@ -25,6 +25,7 @@ local type              = type
 local unpack            = unpack
 
 local math_abs          = math.abs
+local math_min          = math.min
 
 local string_find       = string.find
 local string_gmatch     = string.gmatch
@@ -124,7 +125,7 @@ function ElkBuffBars:AddDefaultBargroups()
     })
 end
 
-local STICKTO_AREA = 25
+local STICKTO_AREA = 15 -- was 25; repeatedly reported as snapping too eagerly
 
 -- Ascension (and other Classic/Wrath-based clients) don't define LE_EXPANSION_LEVEL_CURRENT
 -- or the other LE_EXPANSION_* constants introduced by later retail clients, which caused
@@ -363,6 +364,55 @@ function ElkBuffBars:OnInitialize()
     end)
 end
 
+-- re-checks visibility on every bar group that has "Hide Unless Something's About To Expire"
+-- turned on. Only these groups need it -- everyone else's visibility is already fully driven
+-- by aura/combat events, no polling required. See UpdateSoonToExpireTimer below for what
+-- starts and stops this.
+-- re-applies SetPosition() to every group that's stuck to another group. Called whenever any
+-- group's shown/hidden state actually flips (see RefreshContainerVisibility in
+-- EBB_BarGroup.lua), so a group stuck to whatever just changed re-anchors to the nearest now-
+-- visible ancestor. This just re-runs SetPosition on every stuck group rather than working out
+-- exactly which ones are downstream of the group that changed -- SetPosition is cheap (a
+-- handful of SetPoint calls) and GetStickTarget already re-walks each group's own chain fresh,
+-- so there's no need for that bookkeeping.
+function ElkBuffBars:RefreshStuckPositions()
+    for _, bg in pairs(self.bargroups) do
+        if bg.layout.stickto then
+            bg:SetPosition()
+        end
+    end
+end
+
+function ElkBuffBars:RefreshSoonToExpireGroups()
+    for _, bg in pairs(self.bargroups) do
+        if bg.layout.hideunlesssoon then
+            bg:RefreshContainerVisibility()
+        end
+    end
+end
+
+-- starts a lightweight once-a-second timer for RefreshSoonToExpireGroups above if ANY bar
+-- group currently has "Hide Unless Something's About To Expire" enabled, and stops it again if
+-- none do -- so groups not using the option pay zero ongoing cost (same reasoning as the old
+-- always-on self.timer_UpdateGroups this replaces, which polled every group every half-second
+-- whether it needed to or not). Call this whenever hideunlesssoon is toggled, and once at
+-- startup to pick up whatever was already saved from a previous session.
+function ElkBuffBars:UpdateSoonToExpireTimer()
+    local needed = false
+    for _, bg in pairs(self.bargroups) do
+        if bg.layout.hideunlesssoon then
+            needed = true
+            break
+        end
+    end
+    if needed and not self.timer_SoonToExpire then
+        self.timer_SoonToExpire = self:ScheduleRepeatingTimer("RefreshSoonToExpireGroups", 1)
+    elseif not needed and self.timer_SoonToExpire then
+        self:CancelTimer(self.timer_SoonToExpire)
+        self.timer_SoonToExpire = nil
+    end
+end
+
 function ElkBuffBars:OnEnable()
     self:OnProfileEnable()
 
@@ -397,7 +447,7 @@ function ElkBuffBars:OnEnable()
         self:RegisterEvent("PET_BATTLE_CLOSE")
     end
 
---	self.timer_UpdateGroups = self:ScheduleRepeatingTimer("UpdateGroups", .5)
+    self:UpdateSoonToExpireTimer()
 
     LSM.RegisterCallback(self, "LibSharedMedia_Registered", "LibSharedMedia_Update")
     LSM.RegisterCallback(self, "LibSharedMedia_SetGlobal", "LibSharedMedia_Update")
@@ -433,12 +483,14 @@ function ElkBuffBars:PET_BATTLE_OPENING_START()
     for k, v in pairs(self.bargroups) do
         v:GetContainer():Hide()
     end
+    self:RefreshStuckPositions()
 end
 
 function ElkBuffBars:PET_BATTLE_CLOSE()
     for k, v in pairs(self.bargroups) do
         v:GetContainer():Show()
     end
+    self:RefreshStuckPositions()
 end
 
 function ElkBuffBars:OnDisable()
@@ -1392,6 +1444,9 @@ local DEFAULT_LAYOUT = {
         iconcountfont		= "Arial Narrow",		-- <LSM:font>
         iconcountfontsize	= 14,					-- <font size>
         iconcountcolor		= {1, 1, 1, 1},			-- <color set>
+        iconcountstyle		= "OUTLINE",			-- "", OUTLINE, THICKOUTLINE -- matches the previously hardcoded look, so existing setups don't change
+        iconcountbackdrop	= false,				-- true, false
+        iconcountbackdropcolor = {0, 0, 0, 0.6},	-- <color set>
         bar					= true,					-- true, false
         bgbar				= true,					-- true, false
         bartexture			= "Otravi",				-- <LSM:statusbar>, false
@@ -1451,6 +1506,8 @@ local DEFAULT_LAYOUT = {
     hideincombat	= false,						-- true, false -- hides the WHOLE group's bars while in combat
     hidewhennomissing = false,						-- true, false -- hides the WHOLE group unless Show Missing has a red bar up
     hidewhenallmissing = false,					-- true, false -- hides the WHOLE group if every tracked name is missing (0 active)
+    hideunlesssoon	= false,						-- true, false -- hides the WHOLE group unless a bar is inside its expiry warning window
+    hideunlesssoonseconds = 20,					-- 1+ -- how many seconds left counts as "about to expire" for the above, and for blinking
 }
 
 -- resets corrupt entries in the given layout to default values; returns a now valid layout
@@ -1607,6 +1664,22 @@ function ElkBuffBars:PLAYER_TARGET_CHANGED()
     self:ScanData_UnitAura("target", "DEBUFF")
 
     self:UpdateGroups()
+
+    -- Targeting something and clearing it again fast enough can leave the previous target's
+    -- buffs/debuffs stuck on screen -- the scan above runs the instant this event fires, but
+    -- WoW's client can apparently still briefly resolve the "target" token against stale data
+    -- right around a fast swap. A follow-up rescan a beat later catches and corrects that.
+    -- Cancels and reschedules on every call so rapid target-flicking only ever does one final
+    -- confirmation scan once things settle, not one per flick.
+    if self.timer_TargetRescan then
+        self:CancelTimer(self.timer_TargetRescan)
+    end
+    self.timer_TargetRescan = self:ScheduleTimer(function()
+        self.timer_TargetRescan = nil
+        self:ScanData_UnitAura("target", "BUFF")
+        self:ScanData_UnitAura("target", "DEBUFF")
+        self:UpdateGroups()
+    end, 0.15)
 end
 
 function ElkBuffBars:UNIT_PET(args)
@@ -2243,6 +2316,14 @@ local function StickGroup_CheckLoop(self, id, v)
     return false
 end
 
+-- finds the CLOSEST valid stick target across every other group and both orientations
+-- (stacked above/below, or side-by-side) instead of sticking to whichever candidate pairs()
+-- happens to visit first. Table iteration order is unspecified, so with more than one group
+-- in range at once, the old first-match-wins approach could snap to the wrong neighbor, or
+-- even effectively split the difference between two candidates across repeated attempts --
+-- not a mis-detection, just a right-detection-wrong-pick. Score is "how far off the touching
+-- edge is" plus "how far off the alignment is", in pixels, so vertical and horizontal
+-- candidates are directly comparable on the same scale; lower wins.
 function ElkBuffBars:StickGroup(bargroup)
     local layout = bargroup.layout
     local id = layout.id
@@ -2253,84 +2334,72 @@ function ElkBuffBars:StickGroup(bargroup)
     local base_right = container:GetRight()
     local base_top = container:GetTop()
     local base_bottom = container:GetBottom()
-    layout.stickto = nil
-    layout.stickmode = nil
-    layout.stickvalign = nil
---	self:Print("Sticking bargroup", id)
-    for k, v in pairs(self.bargroups) do
-        if v.layout.id ~= id then
-            local comp_container = v:GetContainer()
-            local comp_y = growup and comp_container:GetTop() or comp_container:GetBottom() or 0
-            if math_abs(comp_y - base_y) < STICKTO_AREA then
-                -- we are on the same y-area (stack above/below)
-                local comp_left = comp_container:GetLeft()
-                local comp_right = comp_container:GetRight()
-                local dist_left = math_abs(base_left - comp_left)
-                local dist_mid = math_abs((base_left + base_right) - (comp_left + comp_right)) / 2
-                local dist_right = math_abs(base_right - comp_right)
-                if dist_left <= STICKTO_AREA or dist_mid <= STICKTO_AREA or dist_right <= STICKTO_AREA then
---					self:Print(" - sticking to bargroup ", k)
-                    -- we are also on the same x-area
-                    -- check if we would loop-stick to ourself
-                    if not StickGroup_CheckLoop(self, id, v) then
-                        -- we have found a valid group to stick to
-                        layout.stickto = k
-                        layout.stickmode = "vertical"
-                        local stickdist = STICKTO_AREA
-                        if dist_mid <= STICKTO_AREA then
-                            layout.stickside = ""
-                            stickdist = dist_mid
-                        end
-                        if dist_left <= STICKTO_AREA and dist_left < stickdist then
-                            layout.stickside = "LEFT"
-                            stickdist = dist_left
-                        end
-                        if dist_right <= STICKTO_AREA and dist_right < stickdist then
-                            layout.stickside = "RIGHT"
-                            stickdist = dist_right
-                        end
-                        bargroup:SetPosition()
-                        return true
-                    end
-                end
-            end
 
-            -- check for side-by-side (beside) proximity: my left edge near their right edge,
-            -- or my right edge near their left edge, aligned top/middle/bottom
+    local best -- { score, k, stickmode, stickside, stickvalign }
+
+    for k, v in pairs(self.bargroups) do
+        if v.layout.id ~= id and not StickGroup_CheckLoop(self, id, v) then
+            local comp_container = v:GetContainer()
             local comp_top = comp_container:GetTop()
             local comp_bottom = comp_container:GetBottom()
             local comp_left = comp_container:GetLeft()
             local comp_right = comp_container:GetRight()
+
+            -- vertical: stack above/below -- my touching edge near their opposite edge,
+            -- aligned left/center/right
+            local comp_y = growup and comp_top or comp_bottom
+            local ygap = comp_y and math_abs(comp_y - base_y)
+            if ygap and ygap <= STICKTO_AREA then
+                local dist_left = math_abs(base_left - comp_left)
+                local dist_mid = math_abs((base_left + base_right) - (comp_left + comp_right)) / 2
+                local dist_right = math_abs(base_right - comp_right)
+                local stickside, aligndist = nil, STICKTO_AREA
+                if dist_mid <= aligndist then stickside, aligndist = "", dist_mid end
+                if dist_left <= STICKTO_AREA and dist_left < aligndist then stickside, aligndist = "LEFT", dist_left end
+                if dist_right <= STICKTO_AREA and dist_right < aligndist then stickside, aligndist = "RIGHT", dist_right end
+                if stickside then
+                    local score = ygap + aligndist
+                    if not best or score < best.score then
+                        best = { score = score, k = k, stickmode = "vertical", stickside = stickside }
+                    end
+                end
+            end
+
+            -- horizontal: side-by-side -- my left/right edge near their opposite edge,
+            -- aligned top/middle/bottom
             local dist_myleft_theirright = math_abs(base_left - comp_right)
             local dist_myright_theirleft = math_abs(base_right - comp_left)
-            if dist_myleft_theirright <= STICKTO_AREA or dist_myright_theirleft <= STICKTO_AREA then
+            local xgap = math_min(dist_myleft_theirright, dist_myright_theirleft)
+            if xgap <= STICKTO_AREA then
                 local dist_top = math_abs(base_top - comp_top)
                 local dist_vmid = math_abs((base_top + base_bottom) - (comp_top + comp_bottom)) / 2
                 local dist_bottom = math_abs(base_bottom - comp_bottom)
-                if dist_top <= STICKTO_AREA or dist_vmid <= STICKTO_AREA or dist_bottom <= STICKTO_AREA then
-                    if not StickGroup_CheckLoop(self, id, v) then
-                        layout.stickto = k
-                        layout.stickmode = "horizontal"
-                        layout.stickside = (dist_myleft_theirright <= dist_myright_theirleft) and "LEFT" or "RIGHT"
-                        local vstickdist = STICKTO_AREA
-                        if dist_vmid <= STICKTO_AREA then
-                            layout.stickvalign = ""
-                            vstickdist = dist_vmid
-                        end
-                        if dist_top <= STICKTO_AREA and dist_top < vstickdist then
-                            layout.stickvalign = "TOP"
-                            vstickdist = dist_top
-                        end
-                        if dist_bottom <= STICKTO_AREA and dist_bottom < vstickdist then
-                            layout.stickvalign = "BOTTOM"
-                            vstickdist = dist_bottom
-                        end
-                        bargroup:SetPosition()
-                        return true
+                local stickvalign, aligndist = nil, STICKTO_AREA
+                if dist_vmid <= aligndist then stickvalign, aligndist = "", dist_vmid end
+                if dist_top <= STICKTO_AREA and dist_top < aligndist then stickvalign, aligndist = "TOP", dist_top end
+                if dist_bottom <= STICKTO_AREA and dist_bottom < aligndist then stickvalign, aligndist = "BOTTOM", dist_bottom end
+                if stickvalign then
+                    local score = xgap + aligndist
+                    if not best or score < best.score then
+                        best = {
+                            score = score, k = k, stickmode = "horizontal",
+                            stickside = (dist_myleft_theirright <= dist_myright_theirleft) and "LEFT" or "RIGHT",
+                            stickvalign = stickvalign,
+                        }
                     end
                 end
             end
         end
+    end
+
+    layout.stickto = best and best.k or nil
+    layout.stickmode = best and best.stickmode or nil
+    layout.stickside = best and best.stickside or nil
+    layout.stickvalign = best and best.stickvalign or nil
+
+    if best then
+        bargroup:SetPosition()
+        return true
     end
     return false
 end
@@ -2594,6 +2663,43 @@ function ElkBuffBars:GetOptions()
                                 set = function(info, value)
                                     for _, bg in pairs(ElkBuffBars.bargroups) do
                                         bg.layout.hidewhenallmissing = value
+                                        bg:RefreshContainerVisibility()
+                                    end
+                                end,
+                            },
+                            hideunlesssoon = {
+                                order = 102.85,
+                                type = "toggle",
+                                width = "double",
+                                name = L["OPTIONS_GROUP_HIDEUNLESSSOON_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_HIDEUNLESSSOON_DESC"],
+                                get = function(info)
+                                    for _, bg in ipairs(ElkBuffBars.db.profile.bargroups) do
+                                        if not bg.hideunlesssoon then return false end
+                                    end
+                                    return true
+                                end,
+                                set = function(info, value)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.hideunlesssoon = value
+                                        bg:RefreshContainerVisibility()
+                                    end
+                                    ElkBuffBars:UpdateSoonToExpireTimer()
+                                end,
+                            },
+                            hideunlesssoonseconds = {
+                                order = 102.9,
+                                type = "range",
+                                name = L["OPTIONS_GROUP_HIDEUNLESSSOONSECONDS_NAME"],
+                                desc = L["OPTIONS_ALLGROUPS_HIDEUNLESSSOONSECONDS_DESC"],
+                                min = 1, max = 120, step = 1, bigStep = 5,
+                                get = function(info)
+                                    local bg = ElkBuffBars.db.profile.bargroups[1]
+                                    return (bg and bg.hideunlesssoonseconds) or 20
+                                end,
+                                set = function(info, v)
+                                    for _, bg in pairs(ElkBuffBars.bargroups) do
+                                        bg.layout.hideunlesssoonseconds = tonumber(v)
                                         bg:RefreshContainerVisibility()
                                     end
                                 end,
@@ -2985,6 +3091,7 @@ local function BuildSelfBuffAltGroupsOptions(id)
                         [0] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_ANY"],
                         [1] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_SPEC1"],
                         [2] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_SPEC2"],
+                        [3] = L["OPTIONS_GROUP_FILTER_SELFALTGROUP_SPEC_OPTION_SPEC3"],
                     },
                     get = function(info)
                         local ag = ElkBuffBars.db.profile.bargroups[id].filter.selfbuffaltgroups
@@ -3289,6 +3396,33 @@ function ElkBuffBars:GetGroupOptions(id)
                     bg:RefreshContainerVisibility()
                 end,
             },
+            hideunlesssoon = {
+                order = 102.85,
+                type = "toggle",
+                width = "double",
+                name = L["OPTIONS_GROUP_HIDEUNLESSSOON_NAME"],
+                desc = L["OPTIONS_GROUP_HIDEUNLESSSOON_DESC"],
+                get = function(info) return ElkBuffBars.db.profile.bargroups[id].hideunlesssoon end,
+                set = function(info)
+                    local bg = ElkBuffBars.bargroups[id]
+                    bg.layout.hideunlesssoon = not bg.layout.hideunlesssoon
+                    bg:RefreshContainerVisibility()
+                    ElkBuffBars:UpdateSoonToExpireTimer()
+                end,
+            },
+            hideunlesssoonseconds = {
+                order = 102.9,
+                type = "range",
+                name = L["OPTIONS_GROUP_HIDEUNLESSSOONSECONDS_NAME"],
+                desc = L["OPTIONS_GROUP_HIDEUNLESSSOONSECONDS_DESC"],
+                min = 1, max = 120, step = 1, bigStep = 5,
+                get = function(info) return ElkBuffBars.db.profile.bargroups[id].hideunlesssoonseconds or 20 end,
+                set = function(info, v)
+                    local bg = ElkBuffBars.bargroups[id]
+                    bg.layout.hideunlesssoonseconds = tonumber(v)
+                    bg:RefreshContainerVisibility()
+                end,
+            },
             anchortext = {
                 order = 103,
                 type = "input",
@@ -3539,6 +3673,47 @@ function ElkBuffBars:GetGroupOptions(id)
                                     bg.layout.bars.iconcountcolor[2] = g
                                     bg.layout.bars.iconcountcolor[3] = b
                                     bg.layout.bars.iconcountcolor[4] = a
+                                    bg:SetLayout()
+                                end,
+                            }, -- <color set>
+                            iconcountstyle = {
+                                order = 107,
+                                type = "select",
+                                name = L["OPTIONS_GROUP_ICON_STACK_STYLE_NAME"],
+                                desc = L["OPTIONS_GROUP_ICON_STACK_STYLE_DESC"],
+                                values = values_text_style,
+                                get = function(info) return ElkBuffBars.db.profile.bargroups[id].bars.iconcountstyle end,
+                                set = function(info, v)
+                                    local bg = ElkBuffBars.bargroups[id]
+                                    bg.layout.bars.iconcountstyle = v
+                                    bg:SetLayout()
+                                end,
+                            }, -- "", OUTLINE, THICKOUTLINE
+                            iconcountbackdrop = {
+                                order = 108,
+                                type = "toggle",
+                                name = L["OPTIONS_GROUP_ICON_STACK_BACKDROP_NAME"],
+                                desc = L["OPTIONS_GROUP_ICON_STACK_BACKDROP_DESC"],
+                                get = function(info) return ElkBuffBars.db.profile.bargroups[id].bars.iconcountbackdrop end,
+                                set = function(info, value)
+                                    local bg = ElkBuffBars.bargroups[id]
+                                    bg.layout.bars.iconcountbackdrop = value
+                                    bg:SetLayout()
+                                end,
+                            }, -- true, false
+                            iconcountbackdropcolor = {
+                                order = 109,
+                                type = "color",
+                                name = L["OPTIONS_GROUP_ICON_STACK_BACKDROPCOLOR_NAME"],
+                                desc = L["OPTIONS_GROUP_ICON_STACK_BACKDROPCOLOR_DESC"],
+                                hasAlpha = true,
+                                get = function(info) return unpack(ElkBuffBars.db.profile.bargroups[id].bars.iconcountbackdropcolor) end,
+                                set = function(info, r, g, b, a)
+                                    local bg = ElkBuffBars.bargroups[id]
+                                    bg.layout.bars.iconcountbackdropcolor[1] = r
+                                    bg.layout.bars.iconcountbackdropcolor[2] = g
+                                    bg.layout.bars.iconcountbackdropcolor[3] = b
+                                    bg.layout.bars.iconcountbackdropcolor[4] = a
                                     bg:SetLayout()
                                 end,
                             }, -- <color set>
@@ -4403,8 +4578,10 @@ function ElkBuffBars:GetGroupOptions(id)
                     local bg = ElkBuffBars.bargroups[id]
                     bg.layout.x = nil
                     bg.layout.y = nil
-                    bg.stickto = nil
-                    bg.stickside = nil
+                    bg.layout.stickto = nil
+                    bg.layout.stickmode = nil
+                    bg.layout.stickside = nil
+                    bg.layout.stickvalign = nil
                     bg:SetPosition()
                 end,
             },
